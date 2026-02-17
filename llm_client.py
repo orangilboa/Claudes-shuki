@@ -5,8 +5,8 @@ Supports any OpenAI-compatible endpoint (Ollama, LM Studio, vLLM,
 LocalAI, etc.) — all common self-hosted options for closed networks.
 """
 from __future__ import annotations
-import json
-from typing import Any, Optional
+import re
+from typing import Optional
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langchain_core.language_models import BaseChatModel
@@ -19,17 +19,7 @@ def build_llm(
     temperature: float = 0.1,
     streaming: bool = False,
 ) -> BaseChatModel:
-    """
-    Build an LLM client pointing at the internal endpoint.
-
-    Works with any OpenAI-compatible server:
-      - Ollama:   base_url=http://localhost:11434/v1  model=llama3
-      - LM Studio: base_url=http://localhost:1234/v1  model=local-model
-      - vLLM:     base_url=http://server:8000/v1      model=model-name
-      - OpenAI:   base_url=https://api.openai.com/v1  api_key=sk-...
-    """
     cfg: LLMConfig = config.llm
-
     return ChatOpenAI(
         base_url=f"{cfg.base_url.rstrip('/')}/v1",
         api_key=cfg.api_key,
@@ -37,7 +27,6 @@ def build_llm(
         max_tokens=max_tokens or cfg.executor_budget_tokens,
         temperature=temperature,
         streaming=streaming,
-        # Disable retries so failures surface immediately
         max_retries=1,
     )
 
@@ -48,13 +37,39 @@ def build_llm_with_tools(tools: list, max_tokens: Optional[int] = None) -> BaseC
     return llm.bind_tools(tools)
 
 
+def _strip_think_blocks(text: str) -> str:
+    """
+    Remove Qwen3 (and similar) <think>...</think> reasoning blocks from
+    message content before storing in history.
+
+    These blocks are internal monologue — keeping them in history inflates
+    context, confuses subsequent turns, and makes the model think it already
+    took actions it only *thought* about taking.
+    """
+    if not text:
+        return text
+    # Remove <think>...</think> including multiline content
+    cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    return cleaned.strip()
+
+
+def _sanitise_message(m):
+    """Replace None content with empty string, strip think blocks."""
+    content = m.content
+    if content is None:
+        content = ""
+    elif isinstance(content, str):
+        content = _strip_think_blocks(content)
+    return m.model_copy(update={"content": content})
+
+
 class BudgetedSession:
     """
     A single isolated LLM session.
-    
-    The key primitive for small-context operation:
-    each subtask gets exactly ONE session with a fresh message list.
-    Context is assembled externally and injected as the system prompt.
+
+    Key primitive for small-context operation: each subtask gets exactly
+    ONE session with a fresh message list. Context is assembled externally
+    and injected as the system prompt.
     """
 
     def __init__(
@@ -76,11 +91,15 @@ class BudgetedSession:
     def invoke(self, user_message: str) -> AIMessage:
         self.messages.append(HumanMessage(content=user_message))
         if self.verbose:
-            print(f"\n[Session] user → {user_message[:100]}...")
+            print(f"\n[Session] → {user_message[:120]}")
         response: AIMessage = self.llm.invoke(self.messages)
+        # Strip think blocks before storing — they must not accumulate in history
+        response = _sanitise_message(response)
         self.messages.append(response)
         if self.verbose:
-            print(f"[Session] assistant → {str(response.content)[:200]}...")
+            content_preview = str(response.content)[:200]
+            tc = len(getattr(response, "tool_calls", []) or [])
+            print(f"[Session] ← {content_preview} [tool_calls: {tc}]")
         return response
 
     def append_tool_result(self, tool_call_id: str, result: str, tool_name: str):
@@ -92,26 +111,21 @@ class BudgetedSession:
 
     def continue_after_tools(self) -> AIMessage:
         """
-        Call the LLM again after tool results have been appended, so it can
-        see those results and either make more tool calls or give a final answer.
-
-        Sanitises the message list first — any message with None content gets
-        replaced with an empty string so the tokenizer never sees a None.
+        Call the LLM again after tool results have been appended.
+        Sanitises all messages before the call (None content, think blocks).
         """
-        safe_messages = []
-        for m in self.messages:
-            if m.content is None:
-                m = m.model_copy(update={"content": ""})
-            safe_messages.append(m)
+        safe_messages = [_sanitise_message(m) for m in self.messages]
 
         if self.verbose:
-            print(f"[Session] continuing after tools ({len(safe_messages)} messages)")
+            print(f"[Session] continuing ({len(safe_messages)} messages in history)")
 
         response: AIMessage = self.llm.invoke(safe_messages)
+        response = _sanitise_message(response)
         self.messages.append(response)
 
         if self.verbose:
-            print(f"[Session] assistant → {str(response.content)[:200]}")
+            tc = len(getattr(response, "tool_calls", []) or [])
+            print(f"[Session] ← {str(response.content)[:200]} [tool_calls: {tc}]")
 
         return response
 
@@ -123,7 +137,4 @@ class BudgetedSession:
         return None
 
     def total_chars(self) -> int:
-        total = 0
-        for m in self.messages:
-            total += len(str(m.content))
-        return total
+        return sum(len(str(m.content)) for m in self.messages)

@@ -372,19 +372,61 @@ def executor_node(state: ShukiState) -> dict:
     )
 
     MAX_TOOL_ROUNDS = 8
+    MAX_READ_CALLS = 4      # prevent the model spiralling through the whole codebase
+    WRITE_TOOLS = {"write_file", "patch_file", "create_file", "delete_file"}
+    PHANTOM_EDIT_PHRASES = (
+        "i have ", "i've ", "i updated", "i edited", "i fixed", "i modified",
+        "i added", "i changed", "i patched", "i created", "i wrote",
+        "has been updated", "has been fixed", "has been modified",
+        "successfully updated", "successfully edited",
+    )
+
     response = session.invoke(f"TASK: {task.description}")
 
     tool_calls_made = []
     file_index_updates = {}
+    read_call_count = 0
+    write_tools_called = set()
 
     for _ in range(MAX_TOOL_ROUNDS):
         if not hasattr(response, "tool_calls") or not response.tool_calls:
-            break
+            # Check if the model claimed to edit something without calling a tool —
+            # this is the Qwen3 "thinks about it then says it's done" hallucination.
+            response_text = str(response.content).lower()
+            task_needs_write = any(
+                w in task.description.lower()
+                for w in ("fix", "edit", "add", "update", "change", "remove",
+                          "delete", "write", "create", "modify", "refactor", "import")
+            )
+            phantom_claimed = any(phrase in response_text for phrase in PHANTOM_EDIT_PHRASES)
+
+            if task_needs_write and phantom_claimed and not write_tools_called:
+                if verbose:
+                    print("  [Executor] Phantom edit detected — model claimed action without calling tools. Re-prompting.")
+                response = session.invoke(
+                    "You described what to do but did not call any tools. "
+                    "You MUST use patch_file or write_file to make the actual change now. "
+                    "Do not describe the change — make it."
+                )
+                continue
+
+            break  # genuine completion or no tools needed
 
         for tc in response.tool_calls:
             name = tc["name"]
             args = tc["args"]
             tool_id = tc["id"]
+
+            # Enforce read cap to prevent codebase-wide exploration
+            if name == "read_file":
+                read_call_count += 1
+                if read_call_count > MAX_READ_CALLS:
+                    result = "ERROR: Read limit reached. You have enough context — proceed with the edit now."
+                    session.append_tool_result(tool_id, result, name)
+                    tool_calls_made.append({"tool": name, "args": args, "result": result})
+                    if verbose:
+                        print(f"  [Executor] Read cap hit ({MAX_READ_CALLS}), blocking further reads")
+                    continue
 
             if verbose:
                 print(f"  [Tool] {name}({json.dumps(args)[:80]})")
@@ -401,8 +443,10 @@ def executor_node(state: ShukiState) -> dict:
             if verbose:
                 print(f"  [Result] {str(result)[:120]}")
 
-            if name in ("write_file", "patch_file", "create_file") and "path" in args:
-                file_index_updates[args["path"]] = f"Modified by task {task.id}: {task.title}"
+            if name in WRITE_TOOLS:
+                write_tools_called.add(name)
+                if "path" in args:
+                    file_index_updates[args["path"]] = f"Modified by task {task.id}: {task.title}"
             if name == "read_file" and "path" in args and isinstance(result, str):
                 file_index_updates[args["path"]] = result[:200]
 
