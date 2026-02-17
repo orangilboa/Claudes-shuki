@@ -1,4 +1,4 @@
-# Codex — Coding Agent for Closed Networks
+# Shuki — Coding Agent for Closed Networks
 
 A Claude Code–style coding agent built with LangGraph, designed for **small-context internal LLMs** on closed Windows networks.
 
@@ -10,214 +10,286 @@ A Claude Code–style coding agent built with LangGraph, designed for **small-co
 User Request
      │
      ▼
-┌─────────────┐     Ordered SubTask list (JSON)
-│   PLANNER   │────────────────────────────────────►
-└─────────────┘                                     │
-                                                    ▼ (loop per task)
-                                         ┌────────────────────┐
-                                         │  CONTEXT ASSEMBLER │
-                                         │  - task description│
-                                         │  - dep. summaries  │
-                                         │  - file snippets   │
-                                         └────────┬───────────┘
-                                                  │
-                                                  ▼
-                                         ┌────────────────────┐
-                                         │     EXECUTOR       │◄──── tools
-                                         │  Isolated session  │
-                                         │  fresh context     │
-                                         └────────┬───────────┘
-                                                  │
-                                                  ▼
-                                         ┌────────────────────┐
-                                         │    SUMMARIZER      │
-                                         │  1-2 sentence      │
-                                         │  compressed result │
-                                         └────────┬───────────┘
-                                                  │
-                              ┌───────────────────┤
-                              │                   │
-                         more tasks            done
-                              │                   │
-                              ▼                   ▼
-                          EXECUTOR          ┌────────────┐
-                                            │ FINALIZER  │
-                                            └─────┬──────┘
-                                                  │
-                                                  ▼
-                                            Final Answer
+┌─────────────┐
+│   PLANNER   │  Breaks request into ordered subtasks (one focused job each)
+└──────┬──────┘
+       │  for each subtask:
+       ▼
+┌─────────────────┐
+│ RULES SELECTOR  │  Loads .shuki rules from global + project dirs
+│                 │  LLM picks only rules relevant to THIS subtask
+└──────┬──────────┘
+       ▼
+┌─────────────────┐
+│  SKILL PICKER   │  Picks skill(s) from bundled + user skills
+└──────┬──────────┘
+       │
+   [multi-skill?]──YES──► REPLANNER ──► back to RULES SELECTOR (new subtasks)
+       │ NO
+       ▼
+┌─────────────────────────┐
+│    TOOL SELECTOR        │
+│  Pass 1: pick categories│  LLM sees only category names (~5-10 options)
+│  Pass 2: pick tools     │  LLM sees only tools in selected categories
+└──────┬──────────────────┘
+       ▼
+┌─────────────────┐
+│    EXECUTOR     │  Isolated session: task + skill prompt + rules + selected tools
+└──────┬──────────┘
+       ▼
+┌─────────────────┐
+│   SUMMARIZER    │  Compresses result to 1-2 sentences for downstream context
+└──────┬──────────┘
+       │
+  [more tasks?]──YES──► back to RULES SELECTOR
+       │ NO
+       ▼
+┌─────────────────┐
+│   FINALIZER     │  Assembles final answer from all summaries
+└─────────────────┘
 ```
 
-### Why this design?
+### Why this design handles small context windows
 
-**Small context window problem:** Most self-hosted LLMs have 2K–4K token windows. A naive agent that dumps the whole codebase into context will fail immediately.
+Every executor session is hermetically sealed:
+- **Rules**: LLM picks only relevant rules (not all rules)
+- **Skills**: Matched skill provides targeted instructions
+- **Tools**: LLM sees only the 2-4 tools needed (not all 20+)  
+- **Context**: Prior-task summaries (1-2 sentences each, not full results)
+- **Files**: Snippets only, not whole files
 
-**Solution — hermetic subtasks:**
-- The **Planner** breaks work into small, targeted subtasks with explicit `context_hints` (which files to look at)
-- The **Context Assembler** fetches only relevant file slices and prior-task summaries, respecting a strict token budget
-- Each **Executor** session is completely fresh — no accumulated conversation history
-- The **Summarizer** compresses each result to 1–2 sentences, so downstream tasks pay only a tiny context cost per prior step
+Each pipeline step uses a *tiny* LLM call (60-100 token output) so the
+executor session gets the maximum remaining budget.
 
 ---
 
 ## Setup
 
-### 1. Install dependencies
+### 1. Install
 
 ```powershell
 pip install -r requirements.txt
 ```
 
-### 2. Point at your internal LLM
-
-Set environment variables (or edit `config.py`):
+### 2. Configure your LLM endpoint
 
 ```powershell
-$env:LLM_BASE_URL = "http://your-llm-server:11434"   # Ollama
+$env:LLM_BASE_URL = "http://your-server:11434"   # Ollama, LM Studio, vLLM, etc.
 $env:LLM_MODEL    = "llama3"
-$env:LLM_API_KEY  = "none"   # or your key
-```
-
-Supported servers (all are OpenAI-compatible):
-| Server | Base URL |
-|--------|----------|
-| [Ollama](https://ollama.com) | `http://localhost:11434` |
-| [LM Studio](https://lmstudio.ai) | `http://localhost:1234` |
-| [vLLM](https://github.com/vllm-project/vllm) | `http://server:8000` |
-| [LocalAI](https://localai.io) | `http://localhost:8080` |
-
-### 3. Configure context window
-
-```powershell
-$env:MAX_CONTEXT_TOKENS = "2048"   # adjust to your model's actual limit
-```
-
-The agent will automatically partition this budget across planner, executor, and summarizer.
-
-### 4. Set workspace
-
-```powershell
+$env:LLM_API_KEY  = "none"
+$env:MAX_CONTEXT_TOKENS = "2048"   # your model's actual limit
 $env:WORKSPACE_ROOT = "C:\myproject"
+```
+
+### 3. Add your rules (optional but recommended)
+
+Copy `.shuki.example/` files to configure your team's coding standards:
+
+```powershell
+# Global rules (apply to all projects)
+mkdir "$env:LOCALAPPDATA\.shuki\rules"
+copy .shuki.example\* "$env:LOCALAPPDATA\.shuki\rules\"
+
+# Project-local rules (checked into your repo)
+mkdir .shuki
+# Add .md or .txt files — one rule per file
+```
+
+### 4. Add custom skills (optional)
+
+```powershell
+mkdir "$env:LOCALAPPDATA\.shuki\skills"
+# Add .md or .txt skill files here
 ```
 
 ---
 
 ## Usage
 
-### Interactive REPL (like Claude Code)
+### Interactive REPL
 
 ```powershell
 python main.py
 ```
 
 ```
-codex> add docstrings to all functions in utils.py
-codex> write unit tests for the DataProcessor class
-codex> fix the ImportError in main.py
-codex> !ls          # list workspace files
-codex> !cat app.py  # read a file
-codex> exit
+shuki> add type hints to all functions in auth.py
+shuki> write pytest tests for the DataProcessor class
+shuki> fix the ImportError in main.py and update the README
+shuki> !ls          # list workspace files
+shuki> !cat app.py  # read a file
+shuki> exit
 ```
 
-### One-shot mode
+### One-shot
 
 ```powershell
-python main.py "add type hints to app.py"
-python main.py --workspace C:\myproject "refactor the auth module"
-python main.py --model llama3.1 --context 4096 "write a README"
+python main.py "refactor the auth module to use dataclasses"
+python main.py --workspace C:\myproject --model llama3.1 --context 4096 "write a README"
 ```
 
-### CLI flags
+---
 
-| Flag | Description |
-|------|-------------|
-| `--workspace`, `-w` | Workspace directory |
-| `--model`, `-m` | LLM model name |
-| `--url`, `-u` | LLM base URL |
-| `--context`, `-c` | Max context tokens |
-| `--quiet`, `-q` | Suppress verbose output |
+## Rules (`.shuki` files)
+
+Rules constrain **how** tasks are done — coding style, forbidden patterns, conventions.
+
+**File locations** (both are loaded and merged):
+```
+%LOCALAPPDATA%\.shuki\rules\    ← your personal rules (all projects)
+{workspace}\.shuki\             ← project-specific rules
+```
+
+**Format:** One `.md` or `.txt` file per rule. The filename becomes the rule name.
+
+```markdown
+# No print statements in production code
+
+Never add print() or console.log() to production files.
+Use the project logger: logging.getLogger(__name__).info(...)
+```
+
+The rules selector runs a small LLM call per subtask that picks only rules
+relevant to what that subtask is actually doing. A "no print statements" rule
+won't be injected into a task that's only reading file metadata.
 
 ---
 
-## Available Tools
+## Skills (`skills/` directory)
 
-| Tool | Description |
-|------|-------------|
-| `read_file` | Read file with optional line range |
-| `write_file` | Write/overwrite a file |
-| `patch_file` | Replace a unique string (surgical edit) |
-| `create_file` | Create a new file |
-| `delete_file` | Delete a file or directory |
-| `list_directory` | List directory contents (with recursive option) |
-| `search_in_files` | Regex search across files (like grep) |
-| `run_command` | Run PowerShell/cmd commands |
-| `get_file_info` | Get file size/lines without reading content |
+Skills define **how to approach** a category of work. They're injected as a
+focused system prompt into the executor for matching tasks.
+
+**Bundled skills** (in `skills/`):
+- `coding.md` — general software development
+- `testing.md` — writing and running tests
+- `documentation.md` — docstrings, READMEs, comments
+- `devops.md` — scripts, CI/CD, configuration
+
+**User skills** (`%LOCALAPPDATA%\.shuki\skills\`): add your own.
+
+**Skill file format:**
+```markdown
+# Skill Name — Short Description
+
+You are a [role] completing a [type] task.
+
+## Approach
+...instructions...
+
+## Preferred tools
+tool_a, tool_b, tool_c
+```
+
+**Multi-skill re-planning:** when a subtask matches 2+ skills, it's automatically
+split into smaller subtasks — one per skill — before execution. This prevents
+mixed-skill tasks from degrading quality on small-context models.
 
 ---
 
-## Tuning for Small Context Windows
+## Tools
 
-Edit `config.py`:
+### Bundled tools
+
+| Tool | Category | Description |
+|------|----------|-------------|
+| `read_file` | file_read | Read with optional line range |
+| `get_file_info` | file_read | Size/line count without reading |
+| `list_directory` | file_read | Directory tree listing |
+| `write_file` | file_write | Create or overwrite a file |
+| `patch_file` | file_write | Replace a unique string (surgical edit) |
+| `create_file` | file_write | Create new file (fails if exists) |
+| `delete_file` | file_write | Delete file or directory |
+| `search_in_files` | code_search | Regex/literal search across files |
+| `run_command` | shell | Run PowerShell/cmd commands |
+
+### Tool categories
+
+The selector auto-adapts based on pool size:
+
+```
+≤ 30 tools  →  single pass: LLM sees all tools, picks directly (no overhead)
+ > 30 tools  →  two passes:
+                  Pass 1: LLM sees only category names (~5-10 options)
+                  Pass 2: LLM sees only tools within selected categories
+```
+
+### Registering external tools
 
 ```python
-llm = LLMConfig(
-    max_context_tokens = 2048,   # your model's actual limit
+from agent.tool_selector import register_tool
 
-    # Token budgets per node (must sum < max_context_tokens)
-    planner_budget_tokens   = 600,   # smaller = simpler plans
-    executor_budget_tokens  = 1000,  # largest budget goes here
-    summarizer_budget_tokens = 300,
+# Any LangChain tool, MCP tool, or callable
+register_tool(my_http_tool, category="web")
+register_tool(my_db_tool,   category="database", name="run_sql")
+```
 
-    # Per-snippet size limits
-    summary_max_chars     = 200,  # chars per prior-task summary
-    file_snippet_max_chars = 500, # chars per injected file snippet
+Registered tools appear in category selection and Pass 2 automatically.
 
-    # Max subtasks in a plan
-    max_subtasks = 8,
+---
+
+## Adding New Tool Categories
+
+In `agent/tool_selector.py`:
+
+```python
+TOOL_CATEGORIES["git"] = ToolCategory(
+    name="git",
+    description="Git operations: diff, log, blame, commit, branch",
+    tools=["git_diff", "git_log", "git_commit"],
 )
 ```
 
-**Rule of thumb:** `planner + executor + summarizer ≤ max_context_tokens × 0.8`
+Then implement the tools in `tools/` and call `register_tool()` at startup.
 
 ---
 
-## Extending
+## Configuration Reference
 
-### Add new tools
-
-Add a `@tool` decorated function to `tools/code_tools.py` and register it in `ALL_TOOLS`.
-
-### Add new node types
-
-Add a node function to `agent/nodes.py` and wire it in `agent/graph.py`.
-
-### Persistent sessions (resume across runs)
-
-```python
-from langgraph.checkpoint.sqlite import SqliteSaver
-saver = SqliteSaver.from_conn_string("codex.db")
-graph = build_graph(checkpointer=saver)
-```
-
-### Parallel subtask execution
-
-Replace sequential routing in `agent/nodes.py` with a `Send` API fan-out for tasks with no unmet dependencies.
+| Environment variable | Default | Description |
+|---------------------|---------|-------------|
+| `LLM_BASE_URL` | `http://localhost:11434` | LLM server URL |
+| `LLM_MODEL` | `llama3` | Model name |
+| `LLM_API_KEY` | `ollama` | API key |
+| `MAX_CONTEXT_TOKENS` | `2048` | Context window size |
+| `WORKSPACE_ROOT` | `./workspace` | Working directory |
+| `SHUKI_SHELL` | `powershell` | Shell for run_command |
+| `SHUKI_VERBOSE` | `1` | Print debug info |
+| `SHUKI_GLOBAL_DIR` | auto | Override global .shuki location |
+| `SHUKI_SKILLS_DIR` | auto | Override bundled skills location |
+| `COMMAND_TIMEOUT` | `30` | Shell command timeout (seconds) |
 
 ---
 
 ## Project Structure
 
 ```
-codex/
-├── main.py              # CLI entry point / REPL
-├── config.py            # All configuration
+shuki/
+├── main.py                  # CLI entry point / REPL
+├── config.py                # All configuration
 ├── requirements.txt
+│
 ├── agent/
-│   ├── graph.py         # LangGraph graph definition
-│   ├── nodes.py         # Planner, Executor, Summarizer, Finalizer
-│   ├── state.py         # CodexState + SubTask dataclasses
-│   ├── context.py       # Context assembler (token budget manager)
-│   └── llm_client.py    # LLM client + BudgetedSession
-└── tools/
-    └── code_tools.py    # All LangChain tools
+│   ├── graph.py             # LangGraph wiring
+│   ├── nodes.py             # All node functions + routers
+│   ├── state.py             # ShukiState + SubTask dataclasses
+│   ├── context.py           # Context assembler (token budget manager)
+│   ├── llm_client.py        # BudgetedSession (isolated LLM calls)
+│   ├── rules.py             # Rules loader + relevance selector
+│   ├── skills.py            # Skill loader + picker
+│   └── tool_selector.py     # 2-pass tool category + specific selection
+│
+├── tools/
+│   └── code_tools.py        # Built-in LangChain tools
+│
+├── skills/                  # Bundled skill definitions (md/txt)
+│   ├── coding.md
+│   ├── testing.md
+│   ├── documentation.md
+│   └── devops.md
+│
+└── .shuki.example/          # Example rule files to copy to your .shuki dir
+    ├── no_print_statements.md
+    ├── always_type_hints.md
+    └── prefer_pathlib.md
 ```

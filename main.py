@@ -1,5 +1,5 @@
 """
-Codex — a Claude Code-style agent for closed Windows networks.
+Shuki — a Claude Code-style agent for closed Windows networks.
 
 Usage:
     python main.py                          # interactive REPL
@@ -12,8 +12,8 @@ Environment variables:
     LLM_API_KEY      API key if required (default: ollama)
     MAX_CONTEXT_TOKENS  Context window size (default: 2048)
     WORKSPACE_ROOT   Working directory (default: ./workspace)
-    CODEX_SHELL      Shell: powershell or cmd (default: powershell)
-    CODEX_VERBOSE    Print debug info: 0/1 (default: 1)
+    SHUKI_SHELL      Shell: powershell or cmd (default: powershell)
+    SHUKI_VERBOSE    Print debug info: 0/1 (default: 1)
 """
 from __future__ import annotations
 import argparse
@@ -31,12 +31,12 @@ from agent.graph import build_graph_with_memory
 
 
 BANNER = r"""
- ██████╗ ██████╗ ██████╗ ███████╗██╗  ██╗
-██╔════╝██╔═══██╗██╔══██╗██╔════╝╚██╗██╔╝
-██║     ██║   ██║██║  ██║█████╗   ╚███╔╝ 
-██║     ██║   ██║██║  ██║██╔══╝   ██╔██╗ 
-╚██████╗╚██████╔╝██████╔╝███████╗██╔╝ ██╗
- ╚═════╝ ╚═════╝ ╚═════╝ ╚══════╝╚═╝  ╚═╝
+ ██████╗ ██████╗ ███████╗███╗   ██╗███████╗██╗  ██╗██╗   ██╗██╗  ██╗██╗
+██╔═══██╗██╔══██╗██╔════╝████╗  ██║██╔════╝██║  ██║██║   ██║██║ ██╔╝██║
+██║   ██║██████╔╝█████╗  ██╔██╗ ██║███████╗███████║██║   ██║█████╔╝ ██║
+██║   ██║██╔═══╝ ██╔══╝  ██║╚██╗██║╚════██║██╔══██║██║   ██║██╔═██╗ ██║
+╚██████╔╝██║     ███████╗██║ ╚████║███████║██║  ██║╚██████╔╝██║  ██╗██║
+ ╚═════╝ ╚═╝     ╚══════╝╚═╝  ╚═══╝╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝╚═╝
   Coding agent for closed networks
 """
 
@@ -84,7 +84,7 @@ def interactive_repl(graph):
 
     while True:
         try:
-            request = input("codex> ").strip()
+            request = input("shuki> ").strip()
         except (KeyboardInterrupt, EOFError):
             print("\nBye.")
             break
@@ -116,7 +116,7 @@ def interactive_repl(graph):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Codex — coding agent for closed networks")
+    parser = argparse.ArgumentParser(description="Shuki — coding agent for closed networks")
     parser.add_argument("request", nargs="?", help="One-shot request (omit for interactive mode)")
     parser.add_argument("--workspace", "-w", help="Workspace directory")
     parser.add_argument("--model", "-m", help="LLM model name")
