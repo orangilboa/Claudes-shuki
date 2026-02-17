@@ -63,11 +63,28 @@ def run_request(graph, request: str, thread_id: str, verbose: bool = False) -> s
     # Print task summary
     if verbose:
         plan = final_state.get("plan", [])
+        done  = sum(1 for t in plan if t.status == "done")
+        total = len(plan)
         print(f"\n{'─'*60}")
-        print(f"COMPLETED {len(plan)} tasks:")
+        print(f"Task report  ({done}/{total} completed):")
+        STATUS_LABEL = {
+            "done":          "done        ",
+            "running":       "interrupted ",
+            "tools":         "stuck:tools ",
+            "skills":        "stuck:skills",
+            "rules":         "stuck:rules ",
+            "needs_resplit": "needs-resplit",
+            "failed":        "FAILED      ",
+            "pending":       "not reached ",
+        }
         for t in plan:
-            status = "✓" if t.status == "done" else "✗"
-            print(f"  {status} [{t.id}] {t.title}")
+            label = STATUS_LABEL.get(t.status, t.status.ljust(12))
+            tools = ", ".join(c["tool"] for c in t.tool_calls_made) or "none"
+            print(f"  [{label}]  [{t.id}] {t.title}")
+            if t.result_summary:
+                print(f"               → {t.result_summary}")
+            elif t.status not in ("pending", "done"):
+                print(f"               tools used: {tools}")
 
     return answer
 

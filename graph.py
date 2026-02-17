@@ -69,7 +69,8 @@ def build_graph(checkpointer=None):
 
     # Rules → tool selection
     builder.add_edge("rules_selector", "tool_selector")
-    builder.add_edge("executor",      "summarizer")
+    builder.add_edge("tool_selector",  "executor")
+    builder.add_edge("executor",       "summarizer")
 
     # Summarizer → next task (loop) or done
     builder.add_conditional_edges(
