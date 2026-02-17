@@ -20,7 +20,7 @@ from config import config
 from agent.state import ShukiState, SubTask
 from agent.context import ContextAssembler
 from agent.llm_client import BudgetedSession
-from agent.rules import load_all_rules, select_relevant_rules, format_rules_for_context
+from agent.rules import load_all_rules, select_relevant_rules
 from agent.skills import load_all_skills, pick_skills, needs_resplit
 from agent.tool_selector import select_tools_for_task, get_tools_for_names
 from tools.code_tools import ALL_TOOLS, TOOL_MAP
@@ -59,6 +59,8 @@ and should require AT MOST 1-2 files.
 
 Rules:
 - Max {max_subtasks} subtasks.
+- ALWAYS add an explicit "read" subtask before any "write" or "edit" subtask.
+  Never create a write/edit subtask without a preceding read subtask for the same file.
 - Prefer small surgical changes over large rewrites.
 - depends_on lists task IDs that must finish first.
 
@@ -302,13 +304,34 @@ def tool_selector_node(state: ShukiState) -> dict:
 
 # ── Executor ──────────────────────────────────────────────────────────────────
 
-EXECUTOR_SYSTEM = """You are a precise assistant. Complete EXACTLY the task described.
-Do not do anything beyond the task scope.
-Use tools as needed. When done, write a brief summary of what you accomplished.
+def _build_executor_system(task: SubTask, context_str: str) -> str:
+    """
+    Build a flat, simple system prompt for the executor.
+    Small models do better with plain instructions than with heavily formatted sections.
+    """
+    parts = []
 
-{skill_section}
-{rules_section}
-{context}"""
+    parts.append("You are a precise assistant completing a single focused task.")
+    parts.append("Rules:")
+    parts.append("- Complete ONLY the task described. Do nothing else.")
+    parts.append("- Before editing or writing any file, ALWAYS read it first with read_file.")
+    parts.append("- Use patch_file for small edits. Only use write_file when creating from scratch.")
+    parts.append("- Write real content. Never use placeholders like 'item1', 'example1', 'TODO'.")
+    parts.append("- When done, write one sentence summarising exactly what you did.")
+
+    if task.skill_prompt:
+        # Only include the first 300 chars of the skill — enough for the key guidance
+        skill_excerpt = task.skill_prompt[:300].strip()
+        parts.append(f"\nGuidance: {skill_excerpt}")
+
+    if task.selected_rules:
+        rules_text = " | ".join(r[:120].replace("\n", " ") for r in task.selected_rules)
+        parts.append(f"\nConstraints: {rules_text}")
+
+    if context_str:
+        parts.append(f"\nContext:\n{context_str}")
+
+    return "\n".join(parts)
 
 
 def executor_node(state: ShukiState) -> dict:
@@ -330,21 +353,10 @@ def executor_node(state: ShukiState) -> dict:
     tool_map = {getattr(t, 'name', str(t)): t for t in tool_objects}
     tool_names_str = ", ".join(tool_map.keys())
 
-    # Assemble context
+    # Assemble context and system prompt
     assembler = ContextAssembler()
     context_str = assembler.build(task, state)
-
-    skill_section = ""
-    if task.skill_prompt:
-        skill_section = f"=== SKILL GUIDANCE ===\n{task.skill_prompt}\n"
-
-    rules_section = format_rules_for_context(task.selected_rules)
-
-    system = EXECUTOR_SYSTEM.format(
-        skill_section=skill_section,
-        rules_section=rules_section + "\n" if rules_section else "",
-        context=context_str,
-    )
+    system = _build_executor_system(task, context_str)
 
     if verbose:
         print(f"\n[Executor] Task {task.id}: {task.title}")
@@ -397,8 +409,7 @@ def executor_node(state: ShukiState) -> dict:
             tool_calls_made.append({"tool": name, "args": args, "result": str(result)[:300]})
             session.append_tool_result(tool_id, str(result), name)
 
-        response = session.llm.invoke(session.messages)
-        session.messages.append(response)
+        response = session.continue_after_tools()
 
     final_text = str(response.content) if response else "No response"
     task.tool_calls_made = tool_calls_made
