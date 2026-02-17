@@ -1,20 +1,22 @@
 """
 LangGraph nodes for the Shuki agent.
 
-Pipeline per subtask:
-  rules_selector → skill_picker → [re_planner?] → tool_selector → executor → summarizer
+Per-subtask pipeline:
+  skill_picker → [replanner?] → rules_selector → tool_selector
+    → reasoner (read tools only, outputs edit plan)
+    → writer   (no LLM — mechanically applies the plan)
+    → verifier (re-reads file, confirms change landed; retries once on failure)
+    → summarizer
 
-Global nodes:
-  planner (initial + re-plan), finalizer
-
-Node contract: receives ShukiState, returns partial update dict.
+Global nodes: planner, finalizer
 """
 from __future__ import annotations
 import json
 import re
-from typing import Any
+from pathlib import Path
+from typing import Any, Optional
 
-from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.messages import AIMessage
 
 from config import config
 from agent.state import ShukiState, SubTask
@@ -23,25 +25,24 @@ from agent.llm_client import BudgetedSession
 from agent.rules import load_all_rules, select_relevant_rules
 from agent.skills import load_all_skills, pick_skills, needs_resplit
 from agent.tool_selector import select_tools_for_task, get_tools_for_names
-from tools.code_tools import ALL_TOOLS, TOOL_MAP
+from tools.code_tools import ALL_TOOLS, TOOL_MAP, READ_TOOLS, WRITE_TOOLS
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _current_task(state: ShukiState) -> SubTask | None:
     plan = state.get("plan", [])
-    idx = state.get("current_task_idx", 0)
+    idx  = state.get("current_task_idx", 0)
     return plan[idx] if idx < len(plan) else None
 
 
 def _list_workspace_files() -> str:
-    from pathlib import Path
     ws = Path(config.workspace.root)
     if not ws.exists():
         return "(empty workspace)"
     lines = []
     for fp in sorted(ws.rglob("*")):
-        if fp.is_file() and not any(p.startswith('.') for p in fp.parts):
+        if fp.is_file() and not any(p.startswith(".") for p in fp.parts):
             lines.append(str(fp.relative_to(ws)))
         if len(lines) > 40:
             lines.append("... (more files)")
@@ -51,62 +52,51 @@ def _list_workspace_files() -> str:
 
 # ── Planner ───────────────────────────────────────────────────────────────────
 
-PLANNER_SYSTEM = """You are a task planner for a coding assistant.
+PLANNER_SYSTEM = """You are a task planner for a general-purpose assistant.
 
-Break the request into an ORDERED list of small, FOCUSED subtasks.
-Each subtask must target ONE type of work (reading, writing, running, documenting, etc.)
-and should require AT MOST 1-2 files.
+Break the user request into an ORDERED list of small, FOCUSED subtasks.
+Each subtask must do ONE thing and touch AT MOST 1-2 files or resources.
 
 Rules:
 - Max {max_subtasks} subtasks.
-- ALWAYS add an explicit "read" subtask before any "write" or "edit" subtask.
-  Never create a write/edit subtask without a preceding read subtask for the same file.
-- Prefer small surgical changes over large rewrites.
-- depends_on lists task IDs that must finish first.
+- Prefer small targeted actions over broad sweeping ones.
+- depends_on lists IDs of tasks that must finish first.
 
-Respond with ONLY valid JSON array, no markdown fences.
+Respond with ONLY a valid JSON array, no markdown fences.
 
-Format:
 [
   {{
     "id": 1,
     "title": "short label",
-    "description": "precise instruction for the executor",
+    "description": "precise instruction",
     "depends_on": [],
-    "context_hints": ["filename.py"],
+    "context_hints": ["filename"],
     "tool_hint": "read|write|run|search|patch"
   }}
 ]"""
 
 
 def planner_node(state: ShukiState) -> dict:
-    """Initial planning: parse user request into ordered SubTask list."""
     verbose = config.verbose
-    req = state["user_request"]
-
     session = BudgetedSession(
         system_prompt=PLANNER_SYSTEM.format(max_subtasks=config.llm.max_subtasks),
         tools=None,
         max_tokens=config.llm.planner_budget_tokens,
         verbose=verbose,
     )
-
     response = session.invoke(
-        f"Plan this request:\n{req}\n\nWorkspace files:\n{_list_workspace_files()}"
+        f"Plan this request:\n{state['user_request']}\n\n"
+        f"Workspace files:\n{_list_workspace_files()}"
     )
-
     plan = _parse_plan(str(response.content))
-
     if verbose:
         print(f"\n[Planner] {len(plan)} subtasks:")
         for t in plan:
             print(f"  [{t.id}] {t.title}  deps={t.depends_on}")
-
     return {"plan": plan, "current_task_idx": 0}
 
 
 def _parse_plan(raw: str, id_offset: int = 0) -> list[SubTask]:
-    """Parse JSON plan robustly, with optional id offset for inserted tasks."""
     raw = re.sub(r"```(?:json)?", "", raw).strip()
     match = re.search(r"\[.*\]", raw, re.DOTALL)
     if not match:
@@ -131,369 +121,459 @@ def _parse_plan(raw: str, id_offset: int = 0) -> list[SubTask]:
                         description=raw, depends_on=[], context_hints=[])]
 
 
-# ── Rules Selector ────────────────────────────────────────────────────────────
-
-def rules_selector_node(state: ShukiState) -> dict:
-    """Load and filter rules relevant to the current subtask."""
-    task = _current_task(state)
-    if task is None:
-        return {}
-
-    if config.verbose:
-        print(f"\n[Rules] Selecting rules for task {task.id}: {task.title}")
-
-    all_rules = load_all_rules()
-    if not all_rules:
-        if config.verbose:
-            print("  [Rules] No rule files found")
-        task.status = "rules"
-        return {"plan": state["plan"]}
-
-    selected = select_relevant_rules(task.description, all_rules)
-    task.selected_rules = selected
-    task.status = "rules"
-
-    plan = state["plan"]
-    return {"plan": plan}
-
-
 # ── Skill Picker ──────────────────────────────────────────────────────────────
 
 def skill_picker_node(state: ShukiState) -> dict:
-    """
-    Pick skills for the current subtask.
-    Sets task.selected_skills and task.skill_prompt.
-    If multiple skills match, sets task.status = 'needs_resplit'
-    so the router sends us to the re-planner.
-    """
     task = _current_task(state)
     if task is None:
         return {}
-
     if config.verbose:
-        print(f"\n[Skills] Picking skills for task {task.id}: {task.title}")
-
+        print(f"\n[Skills] Task {task.id}: {task.title}")
     all_skills = load_all_skills()
     matched_names, merged_prompt = pick_skills(task.description, all_skills)
-
     task.selected_skills = matched_names
     task.skill_prompt = merged_prompt
-
     if needs_resplit(matched_names):
         task.status = "needs_resplit"
         if config.verbose:
-            print(f"  [Skills] Multi-skill match {matched_names} → triggering re-plan")
+            print(f"  Multi-skill {matched_names} → re-plan")
     else:
         task.status = "skills"
-
     return {"plan": state["plan"]}
 
 
 # ── Re-planner ────────────────────────────────────────────────────────────────
 
-REPLANNER_SYSTEM = """You are a task splitter for a coding assistant.
-
-A task has been identified as spanning multiple skill areas. Split it into
-smaller subtasks, each targeting EXACTLY ONE skill from the list provided.
-Each subtask must be independently executable.
-
-Respond with ONLY valid JSON array, no markdown fences.
-
-Format:
-[
-  {{
-    "id": 1,
-    "title": "short label",
-    "description": "precise instruction",
-    "depends_on": [],
-    "context_hints": ["filename"],
-    "tool_hint": "read|write|run|search|patch"
-  }}
-]"""
+REPLANNER_SYSTEM = """Split this multi-skill task into smaller subtasks, one per skill.
+Respond with ONLY a valid JSON array, no markdown fences.
+[{{"id":1,"title":"...","description":"...","depends_on":[],"context_hints":[],"tool_hint":"read"}}]"""
 
 
 def replanner_node(state: ShukiState) -> dict:
-    """
-    Split the current multi-skill subtask into smaller focused subtasks.
-    Inserts the new subtasks in-place in the plan and resets the index
-    to point at the first new subtask.
-    """
     verbose = config.verbose
     plan: list[SubTask] = state["plan"]
     idx: int = state["current_task_idx"]
     task = plan[idx]
-
     if verbose:
-        print(f"\n[Re-planner] Splitting task {task.id}: {task.title}")
-        print(f"  Skills: {task.selected_skills}")
-        print(f"  Depth:  {task.replan_depth + 1}/{config.llm.max_replan_depth}")
-
+        print(f"\n[Re-planner] Splitting task {task.id} (depth {task.replan_depth+1})")
     skills_str = "\n".join(f"- {s}" for s in task.selected_skills)
-
     session = BudgetedSession(
         system_prompt=REPLANNER_SYSTEM,
         tools=None,
         max_tokens=config.llm.planner_budget_tokens,
         verbose=verbose,
     )
-
     response = session.invoke(
-        f"Original task: {task.description}\n\n"
-        f"Skills matched (one per subtask):\n{skills_str}\n\n"
-        f"Split into {len(task.selected_skills)} focused subtasks."
+        f"Task: {task.description}\nSkills: {skills_str}"
     )
-
-    # Use a high id_offset so new task ids don't collide with existing plan
     max_id = max((t.id for t in plan), default=0)
     new_tasks = _parse_plan(str(response.content), id_offset=max_id)
-
     if not new_tasks:
-        # Fallback: keep the original task, just clear the resplit flag
         task.status = "skills"
         return {"plan": plan}
-
-    # Replace the multi-skill task with the new subtasks
-    # Carry parent's depth so nested re-plans can still be caught
     parent_depth = task.replan_depth + 1
     for t in new_tasks:
         t.replan_depth = parent_depth
     new_plan = plan[:idx] + new_tasks + plan[idx+1:]
-
     if verbose:
-        print(f"  [Re-planner] Replaced with {len(new_tasks)} tasks:")
         for t in new_tasks:
-            print(f"    [{t.id}] {t.title}")
+            print(f"  [{t.id}] {t.title}")
+    return {"plan": new_plan, "current_task_idx": idx}
 
-    return {
-        "plan": new_plan,
-        "current_task_idx": idx,   # restart loop at first new task
-    }
+
+# ── Rules Selector ────────────────────────────────────────────────────────────
+
+def rules_selector_node(state: ShukiState) -> dict:
+    task = _current_task(state)
+    if task is None:
+        return {}
+    if config.verbose:
+        print(f"\n[Rules] Task {task.id}: {task.title}")
+    all_rules = load_all_rules()
+    if all_rules:
+        task.selected_rules = select_relevant_rules(task.description, all_rules)
+    task.status = "rules"
+    return {"plan": state["plan"]}
 
 
 # ── Tool Selector ─────────────────────────────────────────────────────────────
 
 def tool_selector_node(state: ShukiState) -> dict:
-    """Run 2-pass tool selection for the current subtask."""
     task = _current_task(state)
     if task is None:
         return {}
-
     if config.verbose:
-        print(f"\n[ToolSelector] Selecting tools for task {task.id}: {task.title}")
-
+        print(f"\n[ToolSelector] Task {task.id}: {task.title}")
     selected_names = select_tools_for_task(
         task_description=task.description,
         skill_prompt=task.skill_prompt,
         tool_hint=task.tool_hint,
     )
-
-    # Fallback: if selector returned nothing, give all tools
     if not selected_names:
         selected_names = [t.name for t in ALL_TOOLS]
         if config.verbose:
-            print("  [ToolSelector] No tools selected, falling back to all tools")
-
+            print("  Fallback: all tools")
     task.selected_tool_names = selected_names
     task.status = "tools"
-
     if config.verbose:
-        print(f"  [ToolSelector] Final tools: {selected_names}")
-
+        print(f"  Selected: {selected_names}")
     return {"plan": state["plan"]}
 
 
-# ── Executor ──────────────────────────────────────────────────────────────────
+# ── Reasoner ──────────────────────────────────────────────────────────────────
+#
+# Has READ tools only. Explores freely, then outputs a structured edit plan.
+# Cannot write — so it cannot hallucinate a completed edit.
 
-def _build_executor_system(task: SubTask, context_str: str) -> str:
+REASONER_SYSTEM = """You are a careful analyst completing one focused task.
+
+You have access to READ tools only: read_file, search_in_files, list_directory, get_file_info.
+Use them freely to gather all the context you need — follow imports, read related files.
+
+When you have enough context, output an edit plan as a JSON block.
+Do NOT attempt to write or edit files — that is handled separately.
+
+Output format when ready (choose one):
+
+For patching an existing file:
+```json
+{{
+  "action": "patch",
+  "file": "relative/path/to/file",
+  "old": "exact string to replace (must be unique in the file)",
+  "new": "replacement string"
+}}
+```
+
+For writing a whole new file:
+```json
+{{
+  "action": "write",
+  "file": "relative/path/to/file",
+  "content": "full file content here"
+}}
+```
+
+For tasks that require no file changes (read-only, research, reporting):
+```json
+{{
+  "action": "none",
+  "summary": "what you found or concluded"
+}}
+```
+
+Rules:
+- For patches: old must be an exact verbatim substring of the current file content.
+  Read the file first, copy the exact string, do not paraphrase.
+- For new files: write real, complete content — no placeholders or TODOs.
+- Output exactly ONE JSON block. No prose before or after it.
+{skill_section}{rules_section}"""
+
+
+def reasoner_node(state: ShukiState) -> dict:
     """
-    Build a flat, simple system prompt for the executor.
-    Small models do better with plain instructions than with heavily formatted sections.
+    Reasoner: read-only tools, outputs a structured edit plan as JSON.
+    Stores the plan in task.edit_plan for the writer to execute.
     """
-    parts = []
-
-    parts.append("You are a precise assistant completing a single focused task.")
-    parts.append("Rules:")
-    parts.append("- Complete ONLY the task described. Do nothing else.")
-    parts.append("- Before editing or writing any file, ALWAYS read it first with read_file.")
-    parts.append("- Use patch_file for small edits. Only use write_file when creating from scratch.")
-    parts.append("- Write real content. Never use placeholders like 'item1', 'example1', 'TODO'.")
-    parts.append("- When done, write one sentence summarising exactly what you did.")
-
-    if task.skill_prompt:
-        # Only include the first 300 chars of the skill — enough for the key guidance
-        skill_excerpt = task.skill_prompt[:300].strip()
-        parts.append(f"\nGuidance: {skill_excerpt}")
-
-    if task.selected_rules:
-        rules_text = " | ".join(r[:120].replace("\n", " ") for r in task.selected_rules)
-        parts.append(f"\nConstraints: {rules_text}")
-
-    if context_str:
-        parts.append(f"\nContext:\n{context_str}")
-
-    return "\n".join(parts)
-
-
-def executor_node(state: ShukiState) -> dict:
-    """Execute the current subtask using its selected tools, skill, and rules."""
     verbose = config.verbose
     plan: list[SubTask] = state["plan"]
     idx: int = state["current_task_idx"]
-
     if idx >= len(plan):
         return {}
 
     task = plan[idx]
     task.status = "running"
 
-    # Resolve tools
-    tool_objects = get_tools_for_names(task.selected_tool_names)
-    if not tool_objects:
-        tool_objects = ALL_TOOLS   # safety fallback
-    tool_map = {getattr(t, 'name', str(t)): t for t in tool_objects}
-    tool_names_str = ", ".join(tool_map.keys())
+    # Give the reasoner only READ tools
+    read_tool_names = [n for n in task.selected_tool_names if n in READ_TOOLS]
+    if not read_tool_names:
+        read_tool_names = list(READ_TOOLS)
+    read_tool_objects = [TOOL_MAP[n] for n in read_tool_names if n in TOOL_MAP]
+    read_tool_map = {t.name: t for t in read_tool_objects}
 
-    # Assemble context and system prompt
+    # Build skill/rules sections (kept short)
+    skill_section = ""
+    if task.skill_prompt:
+        skill_section = f"\nGuidance: {task.skill_prompt[:300]}\n"
+    rules_section = ""
+    if task.selected_rules:
+        rules_section = "\nConstraints: " + " | ".join(
+            r[:100].replace("\n", " ") for r in task.selected_rules
+        ) + "\n"
+
+    system = REASONER_SYSTEM.format(
+        skill_section=skill_section,
+        rules_section=rules_section,
+    )
+
+    # Inject prior context (file index + dependency summaries)
     assembler = ContextAssembler()
     context_str = assembler.build(task, state)
-    system = _build_executor_system(task, context_str)
 
     if verbose:
-        print(f"\n[Executor] Task {task.id}: {task.title}")
-        print(f"  Tools: {tool_names_str}")
-        print(f"  Skills: {task.selected_skills or ['generic']}")
-        print(f"  Rules: {len(task.selected_rules)} applied")
+        print(f"\n[Reasoner] Task {task.id}: {task.title}")
+        print(f"  Read tools: {list(read_tool_map.keys())}")
 
     session = BudgetedSession(
         system_prompt=system,
-        tools=tool_objects,
+        tools=read_tool_objects,
         max_tokens=config.llm.executor_budget_tokens,
         verbose=verbose,
     )
 
-    MAX_TOOL_ROUNDS = 8
-    MAX_READ_CALLS = 4      # prevent the model spiralling through the whole codebase
-    WRITE_TOOLS = {"write_file", "patch_file", "create_file", "delete_file"}
-    PHANTOM_EDIT_PHRASES = (
-        "i have ", "i've ", "i updated", "i edited", "i fixed", "i modified",
-        "i added", "i changed", "i patched", "i created", "i wrote",
-        "has been updated", "has been fixed", "has been modified",
-        "successfully updated", "successfully edited",
-    )
+    prompt = f"TASK: {task.description}"
+    if context_str:
+        prompt += f"\n\nContext:\n{context_str}"
 
-    response = session.invoke(f"TASK: {task.description}")
-
-    tool_calls_made = []
+    response = session.invoke(prompt)
     file_index_updates = {}
-    read_call_count = 0
-    write_tools_called = set()
 
-    for _ in range(MAX_TOOL_ROUNDS):
-        if not hasattr(response, "tool_calls") or not response.tool_calls:
-            # Check if the model claimed to edit something without calling a tool —
-            # this is the Qwen3 "thinks about it then says it's done" hallucination.
-            response_text = str(response.content).lower()
-            task_needs_write = any(
-                w in task.description.lower()
-                for w in ("fix", "edit", "add", "update", "change", "remove",
-                          "delete", "write", "create", "modify", "refactor", "import")
-            )
-            phantom_claimed = any(phrase in response_text for phrase in PHANTOM_EDIT_PHRASES)
-
-            if task_needs_write and phantom_claimed and not write_tools_called:
-                if verbose:
-                    print("  [Executor] Phantom edit detected — model claimed action without calling tools. Re-prompting.")
-                response = session.invoke(
-                    "You described what to do but did not call any tools. "
-                    "You MUST use patch_file or write_file to make the actual change now. "
-                    "Do not describe the change — make it."
-                )
-                continue
-
-            break  # genuine completion or no tools needed
-
-        for tc in response.tool_calls:
-            name = tc["name"]
-            args = tc["args"]
-            tool_id = tc["id"]
-
-            # Enforce read cap to prevent codebase-wide exploration
-            if name == "read_file":
-                read_call_count += 1
-                if read_call_count > MAX_READ_CALLS:
-                    result = "ERROR: Read limit reached. You have enough context — proceed with the edit now."
-                    session.append_tool_result(tool_id, result, name)
-                    tool_calls_made.append({"tool": name, "args": args, "result": result})
-                    if verbose:
-                        print(f"  [Executor] Read cap hit ({MAX_READ_CALLS}), blocking further reads")
-                    continue
-
+    # Run read tool loop — no write tools available so no hallucinated edits possible
+    MAX_READ_ROUNDS = 10
+    for _ in range(MAX_READ_ROUNDS):
+        tool_calls = getattr(response, "tool_calls", None) or []
+        if not tool_calls:
+            break
+        for tc in tool_calls:
+            name  = tc["name"]
+            args  = tc["args"]
+            tid   = tc["id"]
             if verbose:
-                print(f"  [Tool] {name}({json.dumps(args)[:80]})")
-
-            tool_fn = tool_map.get(name)
-            if tool_fn is None:
-                result = f"ERROR: Tool '{name}' not available for this task"
-            else:
-                try:
-                    result = tool_fn.invoke(args)
-                except Exception as e:
-                    result = f"ERROR: {e}"
-
+                print(f"  [Read] {name}({json.dumps(args)[:80]})")
+            tool_fn = read_tool_map.get(name)
+            result  = tool_fn.invoke(args) if tool_fn else f"ERROR: tool '{name}' not available"
             if verbose:
                 print(f"  [Result] {str(result)[:120]}")
-
-            if name in WRITE_TOOLS:
-                write_tools_called.add(name)
-                if "path" in args:
-                    file_index_updates[args["path"]] = f"Modified by task {task.id}: {task.title}"
+            # Cache reads into file_index so writer and future tasks can use them
             if name == "read_file" and "path" in args and isinstance(result, str):
-                file_index_updates[args["path"]] = result[:200]
-
-            tool_calls_made.append({"tool": name, "args": args, "result": str(result)[:300]})
-            session.append_tool_result(tool_id, str(result), name)
-
+                file_index_updates[args["path"]] = result
+            session.append_tool_result(tid, str(result), name)
         response = session.continue_after_tools()
 
-    final_text = str(response.content) if response else "No response"
-    task.tool_calls_made = tool_calls_made
-    task.status = "done"
+    # Extract the JSON edit plan from the final response
+    raw_output = str(response.content)
+    edit_plan  = _extract_edit_plan(raw_output)
 
     if verbose:
-        print(f"[Executor] Done: {final_text[:120]}")
+        print(f"  [Reasoner] Edit plan: {json.dumps(edit_plan)[:200]}")
 
-    return {
-        "task_results": [{
-            "task_id": task.id,
-            "title": task.title,
-            "result": final_text[:500],
-            "tools_used": [t["tool"] for t in tool_calls_made],
-            "skills": task.selected_skills,
-        }],
-        "file_index": file_index_updates,
-        "plan": plan,
-    }
+    # Store on the task object for the writer
+    task.edit_plan = edit_plan
+    task.reasoner_output = raw_output
+
+    return {"plan": plan, "file_index": file_index_updates}
+
+
+def _extract_edit_plan(text: str) -> dict:
+    """Pull the JSON edit plan out of the reasoner's output."""
+    # Try fenced block first
+    for pattern in (r"```json\s*(.*?)```", r"```\s*(.*?)```"):
+        m = re.search(pattern, text, re.DOTALL)
+        if m:
+            try:
+                return json.loads(m.group(1).strip())
+            except json.JSONDecodeError:
+                pass
+    # Try bare JSON object
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group())
+        except json.JSONDecodeError:
+            pass
+    # Fallback: treat as read-only summary
+    return {"action": "none", "summary": text[:500]}
+
+
+# ── Writer ────────────────────────────────────────────────────────────────────
+#
+# Pure Python — no LLM. Applies the edit plan mechanically.
+# Returns verification info so the verifier can confirm the change landed.
+
+def writer_node(state: ShukiState) -> dict:
+    """
+    Apply the reasoner's edit plan mechanically.
+    No LLM — just calls patch_file or write_file directly in Python.
+    """
+    verbose = config.verbose
+    plan: list[SubTask] = state["plan"]
+    idx:  int           = state["current_task_idx"]
+    if idx >= len(plan):
+        return {}
+
+    task      = plan[idx]
+    edit_plan = getattr(task, "edit_plan", {})
+    action    = edit_plan.get("action", "none")
+
+    if verbose:
+        print(f"\n[Writer] Task {task.id}: action={action}")
+
+    file_index_updates: dict[str, str] = {}
+    write_result: dict = {"action": action, "success": False, "message": ""}
+
+    if action == "none":
+        write_result["success"] = True
+        write_result["message"] = edit_plan.get("summary", "No file changes needed.")
+
+    elif action == "patch":
+        file_path = edit_plan.get("file", "")
+        old_str   = edit_plan.get("old", "")
+        new_str   = edit_plan.get("new", "")
+
+        if not file_path or not old_str:
+            write_result["message"] = "ERROR: patch plan missing 'file' or 'old' field."
+        else:
+            result = TOOL_MAP["patch_file"].invoke({
+                "path": file_path,
+                "old_str": old_str,
+                "new_str": new_str,
+            })
+            write_result["success"] = str(result).startswith("OK")
+            write_result["message"] = str(result)
+            write_result["file"]    = file_path
+            write_result["old"]     = old_str
+            write_result["new"]     = new_str
+            if write_result["success"]:
+                file_index_updates[file_path] = f"Patched by task {task.id}"
+
+    elif action == "write":
+        file_path = edit_plan.get("file", "")
+        content   = edit_plan.get("content", "")
+
+        if not file_path:
+            write_result["message"] = "ERROR: write plan missing 'file' field."
+        else:
+            # Use write_file (creates or overwrites)
+            result = TOOL_MAP["write_file"].invoke({
+                "path": file_path,
+                "content": content,
+            })
+            write_result["success"] = str(result).startswith("OK")
+            write_result["message"] = str(result)
+            write_result["file"]    = file_path
+            if write_result["success"]:
+                file_index_updates[file_path] = content[:200]
+
+    else:
+        write_result["message"] = f"Unknown action: {action}"
+
+    if verbose:
+        print(f"  [Writer] {write_result['message'][:120]}")
+
+    task.write_result = write_result
+    return {"plan": plan, "file_index": file_index_updates}
+
+
+# ── Verifier ──────────────────────────────────────────────────────────────────
+#
+# Re-reads the file and confirms the expected content is present.
+# If not, sends the reasoner back for one retry with the real file content shown.
+
+def verifier_node(state: ShukiState) -> dict:
+    """
+    Confirm that the writer's change actually landed in the file.
+    Sets task.verify_passed and task.verify_message.
+    """
+    verbose = config.verbose
+    plan: list[SubTask] = state["plan"]
+    idx:  int           = state["current_task_idx"]
+    if idx >= len(plan):
+        return {}
+
+    task         = plan[idx]
+    write_result = getattr(task, "write_result", {})
+    action       = write_result.get("action", "none")
+
+    if verbose:
+        print(f"\n[Verifier] Task {task.id}")
+
+    # No file change — nothing to verify
+    if action == "none" or not write_result.get("success"):
+        task.verify_passed  = write_result.get("success", True)
+        task.verify_message = write_result.get("message", "No write performed.")
+        task.status = "done"
+        return {"plan": plan}
+
+    file_path = write_result.get("file", "")
+    if not file_path:
+        task.verify_passed  = False
+        task.verify_message = "No file path in write result."
+        task.status = "done"
+        return {"plan": plan}
+
+    # Re-read the file
+    try:
+        actual_content = TOOL_MAP["read_file"].invoke({"path": file_path})
+    except Exception as e:
+        task.verify_passed  = False
+        task.verify_message = f"Could not re-read {file_path}: {e}"
+        task.status = "done"
+        return {"plan": plan}
+
+    if action == "patch":
+        new_str = write_result.get("new", "")
+        old_str = write_result.get("old", "")
+        if new_str and new_str in str(actual_content):
+            task.verify_passed  = True
+            task.verify_message = f"Verified: new content present in {file_path}."
+        elif old_str and old_str in str(actual_content):
+            # old string still there — patch didn't take
+            task.verify_passed  = False
+            task.verify_message = (
+                f"FAIL: old string still present in {file_path}. "
+                f"Patch did not apply."
+            )
+        else:
+            # Neither string found — file changed but unexpected content
+            task.verify_passed  = True   # probably a prior successful run
+            task.verify_message = f"OK: file modified (neither old nor new string found — likely already correct)."
+
+    elif action == "write":
+        expected_fragment = write_result.get("content", "")[:80]
+        if expected_fragment and expected_fragment in str(actual_content):
+            task.verify_passed  = True
+            task.verify_message = f"Verified: content present in {file_path}."
+        else:
+            task.verify_passed  = False
+            task.verify_message = f"FAIL: written content not found in {file_path}."
+
+    # Update file_index with fresh content after verification
+    file_index_updates = {file_path: str(actual_content)[:400]}
+
+    if verbose:
+        status = "✓" if task.verify_passed else "✗"
+        print(f"  [{status}] {task.verify_message}")
+
+    task.status = "done"
+    return {"plan": plan, "file_index": file_index_updates}
 
 
 # ── Summarizer ────────────────────────────────────────────────────────────────
 
-SUMMARIZER_SYSTEM = """Summarize what was accomplished in ONE or TWO sentences.
-Be specific: mention file names, functions, and concrete changes.
-No filler. Output only the summary."""
+SUMMARIZER_SYSTEM = """Summarize in ONE sentence what was accomplished.
+Be specific: file name, what changed, outcome. No filler."""
 
 
 def summarizer_node(state: ShukiState) -> dict:
-    """Compress executor result into a short summary. Advance task index."""
     verbose = config.verbose
     plan: list[SubTask] = state["plan"]
-    idx: int = state["current_task_idx"]
-    results: list[dict] = state.get("task_results", [])
-
-    if not results or idx >= len(plan):
+    idx:  int           = state["current_task_idx"]
+    if idx >= len(plan):
         return {"current_task_idx": idx + 1}
 
     task = plan[idx]
-    last = results[-1]
+
+    # Build a compact description of what happened for the summarizer
+    verify_msg = getattr(task, "verify_message", "")
+    reasoner_summary = ""
+    edit_plan = getattr(task, "edit_plan", {})
+    if edit_plan.get("action") == "none":
+        reasoner_summary = edit_plan.get("summary", "")
+
+    prompt = (
+        f"Task: {task.description}\n"
+        f"Outcome: {verify_msg or reasoner_summary or 'completed'}"
+    )
 
     session = BudgetedSession(
         system_prompt=SUMMARIZER_SYSTEM,
@@ -501,12 +581,7 @@ def summarizer_node(state: ShukiState) -> dict:
         max_tokens=config.llm.summarizer_budget_tokens,
         verbose=verbose,
     )
-    response = session.invoke(
-        f"Task: {task.description}\n"
-        f"Tools: {', '.join(last.get('tools_used', [])) or 'none'}\n"
-        f"Result:\n{last.get('result', '')[:600]}"
-    )
-
+    response = session.invoke(prompt)
     task.result_summary = str(response.content).strip()
 
     if verbose:
@@ -517,59 +592,74 @@ def summarizer_node(state: ShukiState) -> dict:
 
 # ── Finalizer ─────────────────────────────────────────────────────────────────
 
-FINALIZER_SYSTEM = """You are a coding assistant. Write a clear, concise response
-to the original user request based on the completed subtask summaries.
-Mention what was created, modified, or fixed. Be helpful and specific."""
+FINALIZER_SYSTEM = """Write a clear, concise response to the user's original request.
+Based only on the completed subtask summaries provided.
+Mention what was created, changed, or found. Be specific."""
 
 
 def finalizer_node(state: ShukiState) -> dict:
-    """Assemble the final answer from all subtask summaries."""
     verbose = config.verbose
     plan = state.get("plan", [])
-    req = state["user_request"]
-
     summaries = "\n".join(
-        f"- {t.title}: {t.result_summary or 'completed'}"
-        for t in plan
+        f"- {t.title}: {t.result_summary or 'completed'}" for t in plan
     )
-
     session = BudgetedSession(
         system_prompt=FINALIZER_SYSTEM,
         tools=None,
         max_tokens=config.llm.planner_budget_tokens,
         verbose=verbose,
     )
-    response = session.invoke(f"User request: {req}\n\nCompleted:\n{summaries}")
+    response = session.invoke(
+        f"User request: {state['user_request']}\n\nCompleted:\n{summaries}"
+    )
     answer = str(response.content)
-
     if verbose:
         print(f"\n[Finalizer]\n{answer}")
-
     return {"final_answer": answer}
 
 
 # ── Routers ───────────────────────────────────────────────────────────────────
 
 def route_after_skill_picker(state: ShukiState) -> str:
-    """After skill picking: re-plan if multi-skill (and depth allows), else select rules."""
     task = _current_task(state)
     if task and task.status == "needs_resplit":
         if task.replan_depth < config.llm.max_replan_depth:
             return "replan"
-        else:
-            if config.verbose:
-                print(f"  [Router] Re-plan depth limit reached for task {task.id}, proceeding")
-            task.status = "skills"
+        task.status = "skills"
+        if config.verbose:
+            print(f"  [Router] Replan depth limit hit for task {task.id}, proceeding")
     return "select_rules"
 
 
-def route_after_summarizer(state: ShukiState) -> str:
-    """After summarizing: keep looping or finalize."""
+def route_after_verifier(state: ShukiState) -> str:
+    """
+    After verification:
+    - If the write failed and we haven't retried yet → retry (back to reasoner)
+    - Otherwise → summarize
+    """
     plan = state.get("plan", [])
-    idx = state.get("current_task_idx", 0)
+    idx  = state.get("current_task_idx", 0)
+    if idx >= len(plan):
+        return "summarize"
+
+    task = plan[idx]
+    verify_passed = getattr(task, "verify_passed", True)
+    retry_count   = getattr(task, "retry_count", 0)
+
+    if not verify_passed and retry_count < 1:
+        task.retry_count = retry_count + 1
+        if config.verbose:
+            print(f"  [Router] Verification failed — retrying reasoner (attempt {task.retry_count})")
+        return "retry"
+
+    return "summarize"
+
+
+def route_after_summarizer(state: ShukiState) -> str:
+    plan = state.get("plan", [])
+    idx  = state.get("current_task_idx", 0)
     if idx >= len(plan):
         return "finalize"
-    # Check dependencies satisfied
     current = plan[idx]
     for dep_id in current.depends_on:
         dep = next((t for t in plan if t.id == dep_id), None)

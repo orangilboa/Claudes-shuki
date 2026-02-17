@@ -1,14 +1,16 @@
 """
 LangGraph graph for the Shuki agent.
 
-Full pipeline per subtask:
+Per-subtask pipeline:
   planner
-    └─► skill_picker ──[multi-skill]──► replanner ──► skill_picker (loop)
-          └─[single/no skill]─► rules_selector
-                                      └─► tool_selector
-                                                └─► executor
-                                                      └─► summarizer ──[more tasks]──► skill_picker
-                                                                        [done]──────► finalizer
+    └─► skill_picker ──[multi-skill]──► replanner ──┐
+          └─► rules_selector                        │ (loops back)
+                └─► tool_selector                  │
+                      └─► reasoner  (read tools only, outputs edit plan)
+                            └─► writer    (no LLM, applies plan mechanically)
+                                  └─► verifier ──[fail+retry]──► reasoner
+                                        └─► summarizer ──[more]──► skill_picker
+                                                          [done]──► finalizer
 """
 from __future__ import annotations
 from langgraph.graph import StateGraph, START, END
@@ -17,44 +19,41 @@ from langgraph.checkpoint.memory import MemorySaver
 from agent.state import ShukiState
 from agent.nodes import (
     planner_node,
-    rules_selector_node,
     skill_picker_node,
     replanner_node,
+    rules_selector_node,
     tool_selector_node,
-    executor_node,
+    reasoner_node,
+    writer_node,
+    verifier_node,
     summarizer_node,
     finalizer_node,
     route_after_skill_picker,
+    route_after_verifier,
     route_after_summarizer,
 )
 
 
 def build_graph(checkpointer=None):
-    """
-    Build and compile the Shuki LangGraph.
-
-    Args:
-        checkpointer: Optional LangGraph checkpointer for resumable runs.
-    """
     builder = StateGraph(ShukiState)
 
     # ── Nodes ──────────────────────────────────────────────────────────────────
     builder.add_node("planner",        planner_node)
-    builder.add_node("rules_selector", rules_selector_node)
     builder.add_node("skill_picker",   skill_picker_node)
     builder.add_node("replanner",      replanner_node)
+    builder.add_node("rules_selector", rules_selector_node)
     builder.add_node("tool_selector",  tool_selector_node)
-    builder.add_node("executor",       executor_node)
+    builder.add_node("reasoner",       reasoner_node)
+    builder.add_node("writer",         writer_node)
+    builder.add_node("verifier",       verifier_node)
     builder.add_node("summarizer",     summarizer_node)
     builder.add_node("finalizer",      finalizer_node)
 
     # ── Edges ──────────────────────────────────────────────────────────────────
 
-    # Entry
     builder.add_edge(START, "planner")
     builder.add_edge("planner", "skill_picker")
 
-    # Skills → re-plan OR rules selection
     builder.add_conditional_edges(
         "skill_picker",
         route_after_skill_picker,
@@ -64,21 +63,27 @@ def build_graph(checkpointer=None):
         },
     )
 
-    # Re-planner → back to skills (new subtasks restart the pipeline)
-    builder.add_edge("replanner", "skill_picker")
-
-    # Rules → tool selection
+    builder.add_edge("replanner",      "skill_picker")   # new tasks re-enter from top
     builder.add_edge("rules_selector", "tool_selector")
-    builder.add_edge("tool_selector",  "executor")
-    builder.add_edge("executor",       "summarizer")
+    builder.add_edge("tool_selector",  "reasoner")
+    builder.add_edge("reasoner",       "writer")
+    builder.add_edge("writer",         "verifier")
 
-    # Summarizer → next task (loop) or done
+    builder.add_conditional_edges(
+        "verifier",
+        route_after_verifier,
+        {
+            "retry":     "reasoner",    # one retry with real file content in state
+            "summarize": "summarizer",
+        },
+    )
+
     builder.add_conditional_edges(
         "summarizer",
         route_after_summarizer,
         {
-            "continue":  "skill_picker",   # next subtask enters pipeline from top
-            "finalize":  "finalizer",
+            "continue": "skill_picker",  # next subtask enters pipeline from top
+            "finalize": "finalizer",
         },
     )
 
@@ -88,5 +93,4 @@ def build_graph(checkpointer=None):
 
 
 def build_graph_with_memory():
-    """Convenience: build with in-memory checkpointer."""
     return build_graph(checkpointer=MemorySaver())

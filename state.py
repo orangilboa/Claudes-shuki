@@ -33,6 +33,21 @@ class SubTask:
     # Re-planning depth guard — incremented each time this task triggers a re-plan
     replan_depth: int = 0
 
+    # Set by reasoner — the structured edit plan passed to the writer
+    edit_plan: dict = field(default_factory=dict)
+    # Raw reasoner output (for debugging / retry context)
+    reasoner_output: str = ""
+
+    # Set by writer — outcome of the mechanical apply step
+    write_result: dict = field(default_factory=dict)
+
+    # Set by verifier
+    verify_passed: bool = True
+    verify_message: str = ""
+
+    # Retry counter — verifier allows one reasoner retry on failure
+    retry_count: int = 0
+
     # Filled after execution
     result_summary: Optional[str] = None
     tool_calls_made: list[dict] = field(default_factory=list)

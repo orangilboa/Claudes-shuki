@@ -1,5 +1,5 @@
 """
-Tools available to the Codex executor.
+Tools available to the Shuki executor.
 
 Each tool is a LangChain-compatible structured tool.
 Designed for Windows environments (PowerShell).
@@ -278,3 +278,21 @@ ALL_TOOLS = [
 ]
 
 TOOL_MAP = {t.name: t for t in ALL_TOOLS}
+
+# ── Tool classification ────────────────────────────────────────────────────────
+# Used by the reasoner/writer split: reasoner gets READ_TOOLS only.
+
+READ_TOOLS: set[str] = {
+    "read_file",
+    "get_file_info",
+    "list_directory",
+    "search_in_files",
+}
+
+WRITE_TOOLS: set[str] = {
+    "write_file",
+    "patch_file",
+    "create_file",
+    "delete_file",
+    "run_command",
+}
