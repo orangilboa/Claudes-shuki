@@ -90,6 +90,31 @@ class BudgetedSession:
             ToolMessage(content=result, tool_call_id=tool_call_id, name=tool_name)
         )
 
+    def continue_after_tools(self) -> AIMessage:
+        """
+        Call the LLM again after tool results have been appended, so it can
+        see those results and either make more tool calls or give a final answer.
+
+        Sanitises the message list first — any message with None content gets
+        replaced with an empty string so the tokenizer never sees a None.
+        """
+        safe_messages = []
+        for m in self.messages:
+            if m.content is None:
+                m = m.model_copy(update={"content": ""})
+            safe_messages.append(m)
+
+        if self.verbose:
+            print(f"[Session] continuing after tools ({len(safe_messages)} messages)")
+
+        response: AIMessage = self.llm.invoke(safe_messages)
+        self.messages.append(response)
+
+        if self.verbose:
+            print(f"[Session] assistant → {str(response.content)[:200]}")
+
+        return response
+
     @property
     def last_response(self) -> Optional[AIMessage]:
         for m in reversed(self.messages):
