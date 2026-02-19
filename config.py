@@ -3,6 +3,7 @@ Configuration for the Codex agent.
 Designed for small-context internal LLMs on closed networks.
 """
 import os
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -47,10 +48,19 @@ class WorkspaceConfig:
     command_timeout: int = int(os.getenv("COMMAND_TIMEOUT", "30"))
 
 
+@dataclass
+class PathsConfig:
+    root: Path = Path(__file__).parent
+    shuki: Path = root / ".shuki"
+    skill: Path = shuki / "skill"
+    rules: Path = shuki / "rules"
+    tools: Path = shuki / "tools"
+
 @dataclass 
 class Config:
     llm: LLMConfig = field(default_factory=LLMConfig)
     workspace: WorkspaceConfig = field(default_factory=WorkspaceConfig)
+    paths: PathsConfig = field(default_factory=PathsConfig)
     verbose: bool = os.getenv("CODEX_VERBOSE", "1") == "1"
 
 
