@@ -7,6 +7,12 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 
 @dataclass
 class LLMConfig:
@@ -23,9 +29,9 @@ class LLMConfig:
     chars_per_token: float = 3.5
 
     # Per-node token budgets (must all sum to less than max_context_tokens)
-    planner_budget_tokens: int = 800      # plan generation
-    executor_budget_tokens: int = 1200    # subtask execution (most important)
-    summarizer_budget_tokens: int = 400   # result compression
+    planner_budget_tokens: int = 4000      # plan generation
+    executor_budget_tokens: int = 12000    # subtask execution (most important)
+    summarizer_budget_tokens: int = 4000   # result compression
 
     # Max tokens per prior-task summary injected into executor context
     summary_max_chars: int = 300

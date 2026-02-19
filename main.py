@@ -22,8 +22,12 @@ import sys
 import uuid
 from pathlib import Path
 
-# Make sure the project root is on sys.path
-sys.path.insert(0, str(Path(__file__).parent))
+# Make sure the project root and .shuki are on sys.path
+root = Path(__file__).parent
+sys.path.insert(0, str(root))
+# Add .shuki so 'import tools' works (tools moved to .shuki/tools by setup.py)
+if (root / ".shuki").exists():
+    sys.path.insert(0, str(root / ".shuki"))
 
 from config import config
 from agent.state import initial_state

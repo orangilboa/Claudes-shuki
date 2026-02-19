@@ -17,7 +17,10 @@ This design scales to 200+ tools without ever blowing the context window.
 """
 from __future__ import annotations
 import re
+import importlib.util
+import inspect
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional, Any
 
 from langchain_core.tools import BaseTool
@@ -276,6 +279,14 @@ def select_tools_for_task(
         print(f"  [ToolSelector] Pool size: {pool_size} "
               f"({'single-pass' if pool_size <= TWO_PASS_THRESHOLD else '2-pass'})")
 
+    # ── Dynamic tool discovery ────────────────────────────────────────────────
+    # Scan for extra tools in .shuki/tools before selection
+    _load_local_tools()
+    
+    # Refresh tools list after discovery
+    all_tools = _all_registered_tool_names()
+    pool_size = len(all_tools)
+
     if pool_size <= TWO_PASS_THRESHOLD:
         # ── Single pass: show every tool, pick directly ────────────────────────
         return _select_specific_tools(task_description, all_tools, tool_descriptions)
@@ -313,3 +324,66 @@ def _build_tool_descriptions() -> dict[str, str]:
         first_sentence = doc.split(".")[0].strip()[:100]
         desc[name] = first_sentence
     return desc
+
+
+# ── Local Dynamic Loading ─────────────────────────────────────────────────────
+
+_LOCAL_TOOLS_LOADED = False
+
+def _load_local_tools():
+    """Scan .shuki/tools in workspace and CWD for extra tools."""
+    global _LOCAL_TOOLS_LOADED
+    if _LOCAL_TOOLS_LOADED:
+        return
+    
+    roots = []
+    if config.workspace.root:
+        roots.append(Path(config.workspace.root))
+    cwd = Path.cwd()
+    if cwd not in [Path(r) for r in roots]:
+        roots.append(cwd)
+
+    for r in roots:
+        tools_dir = r / ".shuki" / "tools"
+        if not tools_dir.exists():
+            continue
+            
+        for fp in tools_dir.glob("*.py"):
+            # Skip built-ins and init
+            if fp.name in ("__init__.py", "code_tools.py"):
+                continue
+            try:
+                _load_tools_from_file(fp)
+            except Exception as e:
+                if config.verbose:
+                    print(f"  [ToolSelector] Failed to load local tools from {fp}: {e}")
+    
+    _LOCAL_TOOLS_LOADED = True
+
+
+def _load_tools_from_file(path: Path):
+    """Import a python file and register all tools found within."""
+    module_name = f"shuki.dynamic_tools.{path.stem}"
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        return
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    
+    tools = []
+    # Check for explicit list
+    if hasattr(module, "ALL_TOOLS"):
+        tools.extend(getattr(module, "ALL_TOOLS"))
+    
+    # Also search for decorated tools or classes
+    for name, obj in inspect.getmembers(module):
+        # A LangChain tool typically has these
+        if hasattr(obj, "name") and hasattr(obj, "description") and hasattr(obj, "invoke"):
+            if obj not in tools:
+                tools.append(obj)
+    
+    for t in tools:
+        category = getattr(t, "category", "custom")
+        register_tool(t, category)
+        if config.verbose:
+            print(f"  [ToolSelector] Registered local tool: {getattr(t, 'name', str(t))}")

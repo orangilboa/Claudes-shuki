@@ -36,22 +36,46 @@ def _skill_dirs() -> list[Path]:
     """Return ordered list of skill directories."""
     dirs = []
 
-    # 1. Bundled skills (relative to this file's package root, or config override)
-    from config import config as _cfg
-    if _cfg.paths.install_skills_dir:
-        install_skills = Path(_cfg.paths.install_skills_dir)
-    else:
-        install_skills = Path(__file__).parent.parent / "skills"
-    if install_skills.exists():
-        dirs.append(install_skills)
+    # 1. Bundled skills (relative to this file's package root)
+    install_root = Path(__file__).parent.parent
+    bundled_options = [
+        install_root / "skills",
+        install_root / ".shuki" / "skill",
+        install_root / ".shuki" / "skills",
+    ]
+    for d in bundled_options:
+        if d.exists():
+            dirs.append(d)
 
-    # 2. User-extended skills: %LOCALAPPDATA%\.shuki\skills
+    # 2. Global user-extended skills: %LOCALAPPDATA%\.shuki\skills
     local_app_data = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-    user_skills = Path(local_app_data) / ".shuki" / "skills"
-    if user_skills.exists():
-        dirs.append(user_skills)
+    for sub in ["skills", "skill"]:
+        user_skills = Path(local_app_data) / ".shuki" / sub
+        if user_skills.exists():
+            dirs.append(user_skills)
 
-    return dirs
+    # 3. Local/Workspace skills
+    roots = []
+    if config.workspace.root:
+        roots.append(Path(config.workspace.root))
+    cwd = Path.cwd()
+    if cwd not in [Path(r) for r in roots]:
+        roots.append(cwd)
+
+    for r in roots:
+        shuki_dir = Path(r) / ".shuki"
+        if shuki_dir.exists():
+            for sub in ["skill", "skills"]:
+                subdir = shuki_dir / sub
+                if subdir.exists():
+                    dirs.append(subdir)
+
+    # Return unique paths in order
+    unique = []
+    for d in dirs:
+        if d not in unique:
+            unique.append(d)
+    return unique
 
 
 def load_all_skills() -> dict[str, dict]:

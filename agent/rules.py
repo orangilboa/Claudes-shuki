@@ -29,27 +29,37 @@ def _rules_dirs() -> list[Path]:
     """Return all directories that may contain rule files."""
     dirs = []
 
-    # 1. Global user rules: %LOCALAPPDATA%\.shuki\rules  (or config override)
-    from config import config as _cfg
-    if _cfg.paths.global_shuki_dir:
-        global_rules = Path(_cfg.paths.global_shuki_dir) / "rules"
-    else:
-        local_app_data = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-        global_rules = Path(local_app_data) / ".shuki" / "rules"
+    # 1. Global user rules
+    local_app_data = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    global_rules = Path(local_app_data) / ".shuki" / "rules"
     if global_rules.exists():
         dirs.append(global_rules)
 
-    # 2. Project-local rules: {workspace}/.shuki  (no subdir — flat)
-    local_shuki = Path(config.workspace.root) / ".shuki"
-    if local_shuki.exists():
-        dirs.append(local_shuki)
+    # 2. Local/Workspace rules
+    roots = []
+    if config.workspace.root:
+        roots.append(Path(config.workspace.root))
+    cwd = Path.cwd()
+    if cwd not in [Path(r) for r in roots]:
+        roots.append(cwd)
+    
+    for r in roots:
+        shuki_dir = Path(r) / ".shuki"
+        if shuki_dir.exists():
+            # Check subdir first (standard)
+            rules_subdir = shuki_dir / "rules"
+            if rules_subdir.exists():
+                dirs.append(rules_subdir)
+            # Then flat (for backward compat)
+            if shuki_dir not in dirs:
+                dirs.append(shuki_dir)
 
-    # 3. CWD .shuki (in case cwd != workspace root)
-    cwd_shuki = Path.cwd() / ".shuki"
-    if cwd_shuki.exists() and cwd_shuki != local_shuki:
-        dirs.append(cwd_shuki)
-
-    return dirs
+    # Return unique paths in order
+    unique = []
+    for d in dirs:
+        if d not in unique:
+            unique.append(d)
+    return unique
 
 
 def load_all_rules() -> dict[str, str]:
