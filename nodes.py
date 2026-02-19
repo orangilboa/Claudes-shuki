@@ -55,12 +55,29 @@ def _list_workspace_files() -> str:
 PLANNER_SYSTEM = """You are a task planner for a general-purpose assistant.
 
 Break the user request into an ORDERED list of small, FOCUSED subtasks.
-Each subtask must do ONE thing and touch AT MOST 1-2 files or resources.
+Each subtask MUST touch exactly ONE file or resource.
 
 Rules:
 - Max {max_subtasks} subtasks.
-- Prefer small targeted actions over broad sweeping ones.
+- ONE file per subtask. If work spans multiple files, create separate subtasks for each.
+- For file edits: create separate read subtask first, then write subtask.
+- Prefer small targeted actions (add one function, fix one import, add one test).
 - depends_on lists IDs of tasks that must finish first.
+
+Examples of CORRECT decomposition:
+User: "Add logging to auth.py and config.py"
+Plan: [
+  {{id:1, title:"Read auth.py", ...}},
+  {{id:2, title:"Add logging to auth.py", depends_on:[1], ...}},
+  {{id:3, title:"Read config.py", ...}},
+  {{id:4, title:"Add logging to config.py", depends_on:[3], ...}}
+]
+
+User: "Convert the curl command in run.sh to a Python function in utils.py"
+Plan: [
+  {{id:1, title:"Read run.sh to find curl command", ...}},
+  {{id:2, title:"Write function in utils.py", depends_on:[1], ...}}
+]
 
 Respond with ONLY a valid JSON array, no markdown fences.
 
@@ -68,7 +85,7 @@ Respond with ONLY a valid JSON array, no markdown fences.
   {{
     "id": 1,
     "title": "short label",
-    "description": "precise instruction",
+    "description": "precise instruction for ONE file",
     "depends_on": [],
     "context_hints": ["filename"],
     "tool_hint": "read|write|run|search|patch"
@@ -233,9 +250,9 @@ Use them freely to gather all the context you need — follow imports, read rela
 When you have enough context, output an edit plan as a JSON block.
 Do NOT attempt to write or edit files — that is handled separately.
 
-Output format when ready (choose one):
+━━━ OUTPUT FORMAT (choose one) ━━━
 
-For patching an existing file:
+For patching an existing file (MOST COMMON):
 ```json
 {{
   "action": "patch",
@@ -254,6 +271,18 @@ For writing a whole new file:
 }}
 ```
 
+For multiple coordinated edits in ONE file (e.g. add function + update imports):
+```json
+{{
+  "action": "multi_patch",
+  "file": "relative/path/to/file",
+  "patches": [
+    {{"old": "import os", "new": "import os\\nimport requests"}},
+    {{"old": "# end of file", "new": "def new_func():\\n    pass\\n\\n# end of file"}}
+  ]
+}}
+```
+
 For tasks that require no file changes (read-only, research, reporting):
 ```json
 {{
@@ -262,11 +291,40 @@ For tasks that require no file changes (read-only, research, reporting):
 }}
 ```
 
-Rules:
-- For patches: old must be an exact verbatim substring of the current file content.
-  Read the file first, copy the exact string, do not paraphrase.
-- For new files: write real, complete content — no placeholders or TODOs.
-- Output exactly ONE JSON block. No prose before or after it.
+━━━ EXAMPLES ━━━
+
+Task: "Add a get_user function to auth.py"
+You read auth.py, see the existing code structure.
+Output:
+```json
+{{
+  "action": "patch",
+  "file": "auth.py",
+  "old": "# end of file",
+  "new": "def get_user(user_id: int) -> dict:\\n    return db.query('SELECT * FROM users WHERE id = ?', user_id)\\n\\n# end of file"
+}}
+```
+
+Task: "Change the import in main.py from 'import utils' to 'from utils import helper'"
+You read main.py, copy the exact import line.
+Output:
+```json
+{{
+  "action": "patch",
+  "file": "main.py",
+  "old": "import utils",
+  "new": "from utils import helper"
+}}
+```
+
+━━━ CRITICAL RULES ━━━
+
+- Your task targets ONE file. If you think multiple files need changes, only handle the file mentioned in the task description.
+- For patches: "old" MUST be an exact verbatim copy from the file (copy-paste from the read_file result).
+- For new files: write complete, real code — no placeholders, no "# TODO", no "...".
+- Output EXACTLY ONE JSON block. No prose, no explanation, no code outside the JSON.
+- If the JSON describes code, put actual code in the "new" or "content" field, not pseudo-code.
+
 {skill_section}{rules_section}"""
 
 
@@ -436,6 +494,37 @@ def writer_node(state: ShukiState) -> dict:
             if write_result["success"]:
                 file_index_updates[file_path] = f"Patched by task {task.id}"
 
+    elif action == "multi_patch":
+        file_path = edit_plan.get("file", "")
+        patches   = edit_plan.get("patches", [])
+
+        if not file_path or not patches:
+            write_result["message"] = "ERROR: multi_patch missing 'file' or 'patches' field."
+        else:
+            results = []
+            all_ok = True
+            for i, patch in enumerate(patches):
+                old_str = patch.get("old", "")
+                new_str = patch.get("new", "")
+                if not old_str:
+                    results.append(f"Patch {i+1}: ERROR - missing 'old' field")
+                    all_ok = False
+                    continue
+                result = TOOL_MAP["patch_file"].invoke({
+                    "path": file_path,
+                    "old_str": old_str,
+                    "new_str": new_str,
+                })
+                results.append(f"Patch {i+1}: {result}")
+                if not str(result).startswith("OK"):
+                    all_ok = False
+                    break  # stop on first failure so verifier can see which patch failed
+            write_result["success"] = all_ok
+            write_result["message"] = "\n".join(results)
+            write_result["file"]    = file_path
+            if all_ok:
+                file_index_updates[file_path] = f"Multi-patched by task {task.id}"
+
     elif action == "write":
         file_path = edit_plan.get("file", "")
         content   = edit_plan.get("content", "")
@@ -517,16 +606,34 @@ def verifier_node(state: ShukiState) -> dict:
             task.verify_passed  = True
             task.verify_message = f"Verified: new content present in {file_path}."
         elif old_str and old_str in str(actual_content):
-            # old string still there — patch didn't take
             task.verify_passed  = False
-            task.verify_message = (
-                f"FAIL: old string still present in {file_path}. "
-                f"Patch did not apply."
-            )
+            task.verify_message = f"FAIL: old string still present in {file_path}."
         else:
-            # Neither string found — file changed but unexpected content
-            task.verify_passed  = True   # probably a prior successful run
-            task.verify_message = f"OK: file modified (neither old nor new string found — likely already correct)."
+            task.verify_passed  = True
+            task.verify_message = f"OK: file modified (likely already correct)."
+
+    elif action == "multi_patch":
+        # For multi_patch, verify that at least one of the new strings is present
+        # and none of the old strings remain
+        patches     = edit_plan.get("patches", [])
+        new_found   = 0
+        old_remains = 0
+        for patch in patches:
+            new_str = patch.get("new", "")
+            old_str = patch.get("old", "")
+            if new_str and new_str in str(actual_content):
+                new_found += 1
+            if old_str and old_str in str(actual_content):
+                old_remains += 1
+        if new_found > 0 and old_remains == 0:
+            task.verify_passed  = True
+            task.verify_message = f"Verified: {new_found}/{len(patches)} patches applied to {file_path}."
+        elif old_remains > 0:
+            task.verify_passed  = False
+            task.verify_message = f"FAIL: {old_remains} old strings still in {file_path}."
+        else:
+            task.verify_passed  = True
+            task.verify_message = f"OK: multi-patch applied (likely already correct)."
 
     elif action == "write":
         expected_fragment = write_result.get("content", "")[:80]
