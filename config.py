@@ -28,10 +28,16 @@ class LLMConfig:
     # Rough chars-per-token estimate (conservative for code)
     chars_per_token: float = 3.5
 
-    # Per-node token budgets (must all sum to less than max_context_tokens)
-    planner_budget_tokens: int = 4000      # plan generation
-    executor_budget_tokens: int = 12000    # subtask execution (most important)
-    summarizer_budget_tokens: int = 4000   # result compression
+    # Per-node token budgets — derived in __post_init__ from max_context_tokens:
+    #   planner: 20%, executor: 60%, summarizer: 20%
+    planner_budget_tokens: int = 0
+    executor_budget_tokens: int = 0
+    summarizer_budget_tokens: int = 0
+
+    def __post_init__(self):
+        self.planner_budget_tokens    = int(self.max_context_tokens * 0.20)
+        self.executor_budget_tokens   = int(self.max_context_tokens * 0.60)
+        self.summarizer_budget_tokens = int(self.max_context_tokens * 0.20)
 
     # Max tokens per prior-task summary injected into executor context
     summary_max_chars: int = 300

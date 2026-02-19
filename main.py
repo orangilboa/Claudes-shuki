@@ -22,6 +22,16 @@ import sys
 import uuid
 from pathlib import Path
 
+# Enable arrow-key history and Ctrl-R search in the REPL.
+# readline is built-in on macOS/Linux; on Windows use pyreadline3 (pip install pyreadline3).
+try:
+    import readline
+except ImportError:
+    try:
+        import pyreadline3 as readline  # Windows fallback
+    except ImportError:
+        readline = None  # history unavailable — plain input() used
+
 # Make sure the project root and .shuki are on sys.path
 root = Path(__file__).parent
 sys.path.insert(0, str(root))
@@ -96,6 +106,18 @@ def run_request(graph, request: str, thread_id: str, verbose: bool = False) -> s
 def interactive_repl(graph):
     """Run an interactive REPL session."""
     thread_id = str(uuid.uuid4())
+
+    # Set up persistent readline history
+    if readline is not None:
+        history_file = Path.home() / ".shuki_history"
+        try:
+            readline.read_history_file(history_file)
+        except FileNotFoundError:
+            pass
+        readline.set_history_length(1000)
+        import atexit
+        atexit.register(readline.write_history_file, history_file)
+
     print(BANNER)
     print(f"Workspace : {Path(config.workspace.root).resolve()}")
     print(f"LLM       : {config.llm.model} @ {config.llm.base_url}")

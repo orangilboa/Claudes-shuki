@@ -11,3 +11,6 @@ dataclasses
 
 # Tools & Shell
 # (Most are standard library)
+
+# REPL history (Windows only — macOS/Linux use the built-in readline)
+pyreadline3; sys_platform == "win32"
