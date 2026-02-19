@@ -1,8 +1,8 @@
 """
 LangGraph state for the Shuki agent.
 
-Each subtask carries its own selected rules, skills, and tools —
-chosen by dedicated pipeline steps before the executor runs.
+The planner assigns a skill and tool list to each subtask.
+The executor runs directly against those assignments.
 """
 from __future__ import annotations
 from typing import Annotated, Any, Optional
@@ -21,37 +21,25 @@ class SubTask:
     depends_on: list[int]                   # ids of tasks that must finish first
     context_hints: list[str]                # filenames / keywords to inject
 
-    # Set by pipeline steps (rules → skill → tool selector → executor)
-    selected_rules: list[str] = field(default_factory=list)    # rule file contents
-    selected_skills: list[str] = field(default_factory=list)   # skill names matched
-    skill_prompt: str = ""                                      # merged skill system prompt
-    selected_tool_names: list[str] = field(default_factory=list)  # tool names for executor
+    # Set by planner
+    skill: str = "generic"                  # skill name matched to a .shuki/skill/*.md stem
+    tools: list[str] = field(default_factory=list)  # tool names assigned by planner
 
-    # Legacy hint from planner (used by tool selector as a soft signal)
-    tool_hint: Optional[str] = None
-
-    # Re-planning depth guard — incremented each time this task triggers a re-plan
-    replan_depth: int = 0
-
-    # Set by reasoner — the structured edit plan passed to the writer
-    edit_plan: dict = field(default_factory=dict)
-    # Raw reasoner output (for debugging / retry context)
-    reasoner_output: str = ""
-
-    # Set by writer — outcome of the mechanical apply step
-    write_result: dict = field(default_factory=dict)
+    # Set by executor
+    executor_output: str = ""               # raw final response from executor
+    files_modified: list[str] = field(default_factory=list)  # for verifier
 
     # Set by verifier
     verify_passed: bool = True
     verify_message: str = ""
 
-    # Retry counter — verifier allows one reasoner retry on failure
+    # Retry counter — verifier allows one executor retry on failure
     retry_count: int = 0
 
     # Filled after execution
     result_summary: Optional[str] = None
     tool_calls_made: list[dict] = field(default_factory=list)
-    status: str = "pending"   # pending | rules | skills | tools | running | done | failed
+    status: str = "pending"   # pending | running | done | failed
 
 
 # ── Agent state ───────────────────────────────────────────────────────────────
