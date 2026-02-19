@@ -6,12 +6,29 @@ LocalAI, etc.) — all common self-hosted options for closed networks.
 """
 from __future__ import annotations
 import re
+import time
 from typing import Optional
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langchain_core.language_models import BaseChatModel
 
 from config import config, LLMConfig
+
+
+def _invoke_with_retry(llm, messages, max_retries: int = 3, initial_delay: float = 5.0):
+    """Retry an LLM call on 529 overloaded errors with exponential backoff."""
+    from openai import InternalServerError
+    delay = initial_delay
+    for attempt in range(max_retries + 1):
+        try:
+            return llm.invoke(messages)
+        except InternalServerError as e:
+            if getattr(e, "status_code", None) == 529 and attempt < max_retries:
+                print(f"[LLM] Server overloaded, retrying in {delay:.0f}s (attempt {attempt + 1}/{max_retries})...")
+                time.sleep(delay)
+                delay *= 2
+            else:
+                raise
 
 
 def build_llm(
@@ -92,7 +109,7 @@ class BudgetedSession:
         self.messages.append(HumanMessage(content=user_message))
         if self.verbose:
             print(f"\n[Session] → {user_message}")
-        response: AIMessage = self.llm.invoke(self.messages)
+        response: AIMessage = _invoke_with_retry(self.llm, self.messages)
         # Strip think blocks before storing — they must not accumulate in history
         response = _sanitise_message(response)
         self.messages.append(response)
@@ -118,7 +135,7 @@ class BudgetedSession:
         if self.verbose:
             print(f"[Session] continuing ({len(safe_messages)} messages in history)")
 
-        response: AIMessage = self.llm.invoke(safe_messages)
+        response: AIMessage = _invoke_with_retry(self.llm, safe_messages)
         response = _sanitise_message(response)
         self.messages.append(response)
 

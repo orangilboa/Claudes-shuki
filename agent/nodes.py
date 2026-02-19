@@ -323,7 +323,16 @@ def tool_selector_node(state: ShukiState) -> dict:
 REASONER_SYSTEM = """You are a careful analyst completing one focused task.
 
 You have access to READ tools only: read_file, search_in_files, list_directory, get_file_info.
-Use them freely to gather all the context you need — follow imports, read related files.
+
+━━━ TOOL USAGE STRATEGY ━━━
+
+Prefer search_in_files over read_file for large files:
+- Use search_in_files(pattern="...", path="file.py") to locate specific lines before reading the whole file.
+- Only call read_file when you need surrounding context that search results alone don't provide.
+- For bulk-replace tasks (e.g. "replace all X with Y"), search first to find every occurrence,
+  then read_file once to get the exact surrounding text needed for the edit plan.
+
+Avoid reading the same file multiple times — the content doesn't change between calls.
 
 When you have enough context, output an edit plan as a JSON block.
 Do NOT attempt to write or edit files — that is handled separately.
@@ -431,11 +440,8 @@ def reasoner_node(state: ShukiState) -> dict:
     task = plan[idx]
     task.status = "running"
 
-    # Give the reasoner only READ tools
-    read_tool_names = [n for n in task.selected_tool_names if n in READ_TOOLS]
-    if not read_tool_names:
-        read_tool_names = list(READ_TOOLS)
-    read_tool_objects = [TOOL_MAP[n] for n in read_tool_names if n in TOOL_MAP]
+    # Give the reasoner ALL read tools — tool selector output is for the writer, not the explorer
+    read_tool_objects = [TOOL_MAP[n] for n in READ_TOOLS if n in TOOL_MAP]
     read_tool_map = {t.name: t for t in read_tool_objects}
 
     # Build skill/rules sections (kept short)

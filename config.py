@@ -80,7 +80,7 @@ class Config:
     llm: LLMConfig = field(default_factory=LLMConfig)
     workspace: WorkspaceConfig = field(default_factory=WorkspaceConfig)
     paths: PathsConfig = field(default_factory=PathsConfig)
-    verbose: bool = os.getenv("CODEX_VERBOSE", "1") == "1"
+    verbose: bool = os.getenv("CODEX_VERBOSE", "0") == "1"
 
 
 # Singleton
