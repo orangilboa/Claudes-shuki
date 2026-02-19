@@ -55,10 +55,17 @@ def _needs_discovery(request: str) -> bool:
 
 # ── Discovery ──────────────────────────────────────────────────────────────────
 
-DISCOVERY_SYSTEM = """You are a file discovery agent. 
-Explore the workspace to find files and information relevant to the user request.
-Use 'list_directory' to understand the structure and 'search_in_files' to find keywords.
-When you have enough information for a planner to create a task list, provide a brief summary of relevant files and their roles.
+DISCOVERY_SYSTEM = """You are a file discovery agent.
+Explore the workspace to find ALL files and information relevant to the user request.
+
+ALWAYS start with: list_directory(path=".", recursive=true) to see the full project structure.
+Then use search_in_files to find the relevant code across ALL subdirectories.
+
+When searching for patterns (e.g. print statements), search the ENTIRE workspace:
+  search_in_files(pattern="print\\(", path=".", file_glob="*.py")
+This searches recursively through all subdirectories including agent/, tools/, etc.
+
+Provide a complete summary: list every file that contains relevant code, with line counts.
 """
 
 def discovery_node(state: ShukiState) -> dict:
@@ -362,7 +369,30 @@ For tasks that require no file changes (read-only, research, reporting):
 }}
 ```
 
+━━━ WHEN TO USE WHICH ACTION ━━━
+
+Use "write" when:
+- Making MORE THAN 3 changes scattered across a file (e.g. replace all print() calls,
+  rename a function everywhere, add imports + update multiple call sites).
+- The change is a bulk refactor. Read the full file, apply all changes mentally, output
+  the complete new content. This is far more reliable than many individual patches.
+
+Use "patch" or "multi_patch" only for:
+- 1-3 targeted surgical changes (e.g. fix a single bug, change one function signature).
+
 ━━━ EXAMPLES ━━━
+
+Task: "Replace all print() calls with logger.info() in main.py"
+You read main.py. There are 15 print() calls scattered through the file.
+→ Use "write": output the COMPLETE modified file with every print() replaced.
+Output:
+```json
+{{
+  "action": "write",
+  "file": "main.py",
+  "content": "...complete new file content..."
+}}
+```
 
 Task: "Add a get_user function to auth.py"
 You read auth.py, see the existing code structure.
@@ -376,25 +406,13 @@ Output:
 }}
 ```
 
-Task: "Change the import in main.py from 'import utils' to 'from utils import helper'"
-You read main.py, copy the exact import line.
-Output:
-```json
-{{
-  "action": "patch",
-  "file": "main.py",
-  "old": "import utils",
-  "new": "from utils import helper"
-}}
-```
-
 ━━━ CRITICAL RULES ━━━
 
 - Your task targets ONE file. If you think multiple files need changes, only handle the file mentioned in the task description.
-- For patches: "old" MUST be an exact verbatim copy from the file (copy-paste from the read_file result).
-- For new files: write complete, real code — no placeholders, no "# TODO", no "...".
+- ALWAYS call read_file on the target file before producing any edit plan.
+- For patches: "old" MUST be an exact verbatim copy from the file. Copy-paste from the read_file result — do NOT retype or paraphrase.
+- For write: output the COMPLETE file content — every line, nothing omitted.
 - Output EXACTLY ONE JSON block. No prose, no explanation, no code outside the JSON.
-- If the JSON describes code, put actual code in the "new" or "content" field, not pseudo-code.
 
 {skill_section}{rules_section}"""
 
@@ -586,7 +604,10 @@ def writer_node(state: ShukiState) -> dict:
             write_result["old"]     = old_str
             write_result["new"]     = new_str
             if write_result["success"]:
-                file_index_updates[file_path] = f"Patched by task {task.id}"
+                try:
+                    file_index_updates[file_path] = TOOL_MAP["read_file"].invoke({"path": file_path})
+                except Exception:
+                    file_index_updates[file_path] = f"Patched by task {task.id}"
 
     elif action == "multi_patch":
         file_path = edit_plan.get("file", "")
@@ -623,7 +644,10 @@ def writer_node(state: ShukiState) -> dict:
             write_result["message"] = "\n".join(results)
             write_result["file"]    = file_path
             if all_ok:
-                file_index_updates[file_path] = f"Multi-patched by task {task.id}"
+                try:
+                    file_index_updates[file_path] = TOOL_MAP["read_file"].invoke({"path": file_path})
+                except Exception:
+                    file_index_updates[file_path] = f"Multi-patched by task {task.id}"
 
     elif action == "write":
         file_path = edit_plan.get("file", "")

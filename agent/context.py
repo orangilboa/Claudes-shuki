@@ -58,7 +58,10 @@ class ContextAssembler:
             # Match if the bare filename (or stem) appears in the task description
             bare = Path(fname).name
             if bare.lower() in task.description.lower() or fname.lower() in task.description.lower():
-                snippet = f"Current content of {fname}:\n{cached[:config.llm.file_snippet_max_chars]}"
+                content = cached
+                if config.llm.file_snippet_max_chars > 0:
+                    content = content[:config.llm.file_snippet_max_chars]
+                snippet = f"Current content of {fname}:\n{content}"
                 parts.append(snippet)
                 remaining -= len(snippet)
 
@@ -71,7 +74,8 @@ class ContextAssembler:
                 continue
             snippet = self._fetch_snippet(hint, state)
             if snippet:
-                snippet = snippet[:config.llm.file_snippet_max_chars]
+                if config.llm.file_snippet_max_chars > 0:
+                    snippet = snippet[:config.llm.file_snippet_max_chars]
                 parts.append(snippet)
                 remaining -= len(snippet)
                 injected.add(hint)
@@ -99,16 +103,20 @@ class ContextAssembler:
         # Check file index first (already-read files)
         file_index: dict = state.get("file_index", {})
         if hint in file_index:
-            return f"[Cached info for {hint}]:\n{file_index[hint][:config.llm.file_snippet_max_chars]}"
+            content = file_index[hint]
+            if config.llm.file_snippet_max_chars > 0:
+                content = content[:config.llm.file_snippet_max_chars]
+            return f"[Cached info for {hint}]:\n{content}"
 
         # Try as a file path
         candidate = self.ws / hint
         if candidate.exists() and candidate.is_file():
             try:
                 content = candidate.read_text(encoding="utf-8", errors="replace")
-                # Only grab first N chars (head of file for context)
-                snippet = content[:config.llm.file_snippet_max_chars]
-                return f"[File snippet: {hint}]\n{snippet}"
+                # Only grab first N chars if limit set (0 = unlimited)
+                if config.llm.file_snippet_max_chars > 0:
+                    content = content[:config.llm.file_snippet_max_chars]
+                return f"[File snippet: {hint}]\n{content}"
             except Exception:
                 pass
 
@@ -117,9 +125,10 @@ class ContextAssembler:
             if fp.is_file() and hint.lower() in fp.name.lower():
                 try:
                     content = fp.read_text(encoding="utf-8", errors="replace")
-                    snippet = content[:config.llm.file_snippet_max_chars]
+                    if config.llm.file_snippet_max_chars > 0:
+                        content = content[:config.llm.file_snippet_max_chars]
                     rel = fp.relative_to(self.ws)
-                    return f"[File snippet: {rel}]\n{snippet}"
+                    return f"[File snippet: {rel}]\n{content}"
                 except Exception:
                     pass
 

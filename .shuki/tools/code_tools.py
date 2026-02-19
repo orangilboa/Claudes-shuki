@@ -34,7 +34,7 @@ def _safe_path(rel_or_abs: str) -> Path:
 
 
 def _trunc(text: str, max_chars: int, label: str = "") -> str:
-    if len(text) <= max_chars:
+    if max_chars == 0 or len(text) <= max_chars:
         return text
     half = max_chars // 2
     return f"{text[:half]}\n... [{label} truncated, {len(text)-max_chars} chars omitted] ...\n{text[-half:]}"

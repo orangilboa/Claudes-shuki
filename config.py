@@ -48,7 +48,8 @@ class LLMConfig:
     summary_max_chars: int = 300
 
     # Max chars to include from any single file snippet
-    file_snippet_max_chars: int = 600
+    # Set to 0 for unlimited (respects executor_input_budget instead)
+    file_snippet_max_chars: int = 0
 
     # Max subtasks the planner may generate
     max_subtasks: int = 12
