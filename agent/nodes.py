@@ -420,11 +420,11 @@ def reasoner_node(state: ShukiState) -> dict:
             args  = tc["args"]
             tid   = tc["id"]
             if verbose:
-                print(f"  [Read] {name}({json.dumps(args)[:80]})")
+                print(f"  [Read] {name}({json.dumps(args)})")
             tool_fn = read_tool_map.get(name)
             result  = tool_fn.invoke(args) if tool_fn else f"ERROR: tool '{name}' not available"
             if verbose:
-                print(f"  [Result] {str(result)[:120]}")
+                print(f"  [Result] {str(result)}")
             # Cache reads into file_index so writer and future tasks can use them
             if name == "read_file" and "path" in args and isinstance(result, str):
                 file_index_updates[args["path"]] = result
@@ -436,7 +436,7 @@ def reasoner_node(state: ShukiState) -> dict:
     edit_plan  = _extract_edit_plan(raw_output)
 
     if verbose:
-        print(f"  [Reasoner] Edit plan: {json.dumps(edit_plan)[:200]}")
+        print(f"  [Reasoner] Edit plan: {json.dumps(edit_plan)}")
 
     # Store on the task object for the writer
     task.edit_plan = edit_plan
@@ -576,7 +576,7 @@ def writer_node(state: ShukiState) -> dict:
         write_result["message"] = f"Unknown action: {action}"
 
     if verbose:
-        print(f"  [Writer] {write_result['message'][:120]}")
+        print(f"  [Writer] {write_result['message']}")
 
     task.write_result = write_result
     return {"plan": plan, "file_index": file_index_updates}

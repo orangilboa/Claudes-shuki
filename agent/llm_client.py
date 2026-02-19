@@ -91,15 +91,14 @@ class BudgetedSession:
     def invoke(self, user_message: str) -> AIMessage:
         self.messages.append(HumanMessage(content=user_message))
         if self.verbose:
-            print(f"\n[Session] → {user_message[:120]}")
+            print(f"\n[Session] → {user_message}")
         response: AIMessage = self.llm.invoke(self.messages)
         # Strip think blocks before storing — they must not accumulate in history
         response = _sanitise_message(response)
         self.messages.append(response)
         if self.verbose:
-            content_preview = str(response.content)[:200]
             tc = len(getattr(response, "tool_calls", []) or [])
-            print(f"[Session] ← {content_preview} [tool_calls: {tc}]")
+            print(f"[Session] ← {str(response.content)} [tool_calls: {tc}]")
         return response
 
     def append_tool_result(self, tool_call_id: str, result: str, tool_name: str):
@@ -125,7 +124,7 @@ class BudgetedSession:
 
         if self.verbose:
             tc = len(getattr(response, "tool_calls", []) or [])
-            print(f"[Session] ← {str(response.content)[:200]} [tool_calls: {tc}]")
+            print(f"[Session] ← {str(response.content)} [tool_calls: {tc}]")
 
         return response
 
