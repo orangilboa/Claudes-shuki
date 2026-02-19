@@ -36,51 +36,92 @@ def _current_task(state: ShukiState) -> SubTask | None:
     return plan[idx] if idx < len(plan) else None
 
 
-def _list_workspace_files() -> str:
-    ws = Path(config.workspace.root)
-    if not ws.exists():
-        return "(empty workspace)"
-    lines = []
-    for fp in sorted(ws.rglob("*")):
-        if fp.is_file() and not any(p.startswith(".") for p in fp.parts):
-            lines.append(str(fp.relative_to(ws)))
-        if len(lines) > 40:
-            lines.append("... (more files)")
+def _needs_discovery(request: str) -> bool:
+    """Heuristic to check if a request likely needs workspace file discovery."""
+    req = request.lower()
+    # Mentioning common file extensions or relative/absolute path separators
+    if re.search(r"\.[a-z0-9]{1,4}\b|/|\\", req):
+        return True
+    # Action keywords that imply editing or exploring existing code
+    actions = ["fix", "refactor", "update", "modify", "patch", "change", "add to", "integrate", "debug", "analyze"]
+    if any(a in req for a in actions):
+        return True
+    # Keywords that imply repo-wide knowledge
+    concepts = ["repo", "workspace", "codebase", "project", "module", "function", "class", "logic"]
+    if any(c in req for c in concepts):
+        return True
+    return False
+
+
+# ── Discovery ──────────────────────────────────────────────────────────────────
+
+DISCOVERY_SYSTEM = """You are a file discovery agent. 
+Explore the workspace to find files and information relevant to the user request.
+Use 'list_directory' to understand the structure and 'search_in_files' to find keywords.
+When you have enough information for a planner to create a task list, provide a brief summary of relevant files and their roles.
+"""
+
+def discovery_node(state: ShukiState) -> dict:
+    verbose = config.verbose
+    if verbose:
+        print("\n[Discovery] Exploring workspace...")
+    
+    # We use the read tools to explore
+    read_tools = [TOOL_MAP[n] for n in READ_TOOLS if n in TOOL_MAP]
+    read_tool_map = {t.name: t for t in read_tools}
+    
+    session = BudgetedSession(
+        system_prompt=DISCOVERY_SYSTEM,
+        tools=read_tools,
+        max_tokens=config.llm.max_output_tokens,
+        verbose=verbose,
+    )
+    
+    prompt = f"Find relevant files for this request:\n{state['user_request']}"
+    if state.get("discovery_results"):
+        prompt += f"\n\nPrevious discovery status:\n{state['discovery_results']}"
+
+    response = session.invoke(prompt)
+    
+    # Tool loop for discovery
+    MAX_ROUNDS = 5
+    for _ in range(MAX_ROUNDS):
+        tool_calls = getattr(response, "tool_calls", None) or []
+        if not tool_calls:
             break
-    return "\n".join(lines) if lines else "(empty workspace)"
+        for tc in tool_calls:
+            name = tc["name"]
+            args = tc["args"]
+            tid  = tc["id"]
+            if verbose:
+                print(f"  [Discovery] {name}({json.dumps(args)})")
+            tool_fn = read_tool_map.get(name)
+            result = tool_fn.invoke(args) if tool_fn else f"ERROR: tool '{name}' not available"
+            session.append_tool_result(tid, str(result), name)
+        response = session.continue_after_tools()
+        
+    discovery_results = str(response.content)
+    if verbose:
+        print(f"[Discovery] Summary: {discovery_results[:300].replace(chr(10), ' ')}...")
+        
+    return {"discovery_results": discovery_results}
 
 
 # ── Planner ───────────────────────────────────────────────────────────────────
 
 PLANNER_SYSTEM = """You are a task planner for a general-purpose assistant.
 
-Break the user request into an ORDERED list of small, FOCUSED subtasks.
+Use the provided discovery results to break the user request into an ORDERED list of small, FOCUSED subtasks.
 Each subtask MUST touch exactly ONE file or resource.
 
-Rules:
-- Max {max_subtasks} subtasks.
-- ONE file per subtask. If work spans multiple files, create separate subtasks for each.
-- For file edits: create separate read subtask first, then write subtask.
-- Prefer small targeted actions (add one function, fix one import, add one test).
-- depends_on lists IDs of tasks that must finish first.
+If the discovery results are insufficient and you need more information to make a solid plan, 
+respond with a JSON object asking for more discovery:
+{{
+  "action": "search",
+  "queries": ["what you need to find", "another query"]
+}}
 
-Examples of CORRECT decomposition:
-User: "Add logging to auth.py and config.py"
-Plan: [
-  {{id:1, title:"Read auth.py", ...}},
-  {{id:2, title:"Add logging to auth.py", depends_on:[1], ...}},
-  {{id:3, title:"Read config.py", ...}},
-  {{id:4, title:"Add logging to config.py", depends_on:[3], ...}}
-]
-
-User: "Convert the curl command in run.sh to a Python function in utils.py"
-Plan: [
-  {{id:1, title:"Read run.sh to find curl command", ...}},
-  {{id:2, title:"Write function in utils.py", depends_on:[1], ...}}
-]
-
-Respond with ONLY a valid JSON array, no markdown fences.
-
+Otherwise, respond with a JSON array of subtasks:
 [
   {{
     "id": 1,
@@ -90,27 +131,57 @@ Respond with ONLY a valid JSON array, no markdown fences.
     "context_hints": ["filename"],
     "tool_hint": "read|write|run|search|patch"
   }}
-]"""
+]
+
+Respond with ONLY valid JSON, no markdown fences.
+"""
 
 
 def planner_node(state: ShukiState) -> dict:
     verbose = config.verbose
     session = BudgetedSession(
-        system_prompt=PLANNER_SYSTEM.format(max_subtasks=config.llm.max_subtasks),
+        system_prompt=PLANNER_SYSTEM,
         tools=None,
         max_tokens=config.llm.max_output_tokens,
         verbose=verbose,
     )
-    response = session.invoke(
+    prompt = (
         f"Plan this request:\n{state['user_request']}\n\n"
-        f"Workspace files:\n{_list_workspace_files()}"
+        f"Discovery results:\n{state['discovery_results']}"
     )
-    plan = _parse_plan(str(response.content))
+    response = session.invoke(prompt)
+    raw = str(response.content)
+
+    # Check if planner wants more search
+    search_req = _parse_search_request(raw)
+    if search_req:
+        if verbose:
+            print(f"\n[Planner] Needs more info: {search_req.get('queries')}")
+        return {
+            "discovery_results": f"PLANNER NEEDS MORE INFO: {json.dumps(search_req)}",
+            "plan": []  # Signal router to loop back
+        }
+
+    plan = _parse_plan(raw)
     if verbose:
         print(f"\n[Planner] {len(plan)} subtasks:")
         for t in plan:
             print(f"  [{t.id}] {t.title}  deps={t.depends_on}")
     return {"plan": plan, "current_task_idx": 0}
+
+
+def _parse_search_request(raw: str) -> Optional[dict]:
+    raw = re.sub(r"```(?:json)?", "", raw).strip()
+    # Try to find a JSON object with "action": "search"
+    match = re.search(r"\{.*\}", raw, re.DOTALL)
+    if match:
+        try:
+            data = json.loads(match.group())
+            if isinstance(data, dict) and data.get("action") == "search":
+                return data
+        except json.JSONDecodeError:
+            pass
+    return None
 
 
 def _parse_plan(raw: str, id_offset: int = 0) -> list[SubTask]:
@@ -755,6 +826,20 @@ def finalizer_node(state: ShukiState) -> dict:
 
 
 # ── Routers ───────────────────────────────────────────────────────────────────
+
+def route_start(state: ShukiState) -> str:
+    """Decide whether to run discovery or jump straight to planning."""
+    if _needs_discovery(state["user_request"]):
+        return "discovery"
+    return "planner"
+
+
+def route_after_planner(state: ShukiState) -> str:
+    """If the planner didn't produce a plan, it likely wants more discovery."""
+    if not state.get("plan"):
+        return "discovery"
+    return "skill_picker"
+
 
 def route_after_skill_picker(state: ShukiState) -> str:
     task = _current_task(state)

@@ -75,6 +75,9 @@ class ShukiState(MessagesState):
     # Final answer assembled after all tasks
     final_answer: Optional[str]
 
+    # Results from the discovery step (file lists, search matches, etc.)
+    discovery_results: str
+
     # Error state
     error: Optional[str]
 
@@ -87,6 +90,7 @@ def initial_state(user_request: str) -> dict:
         "current_task_idx": 0,
         "file_index": {},
         "task_results": [],
+        "discovery_results": "",
         "final_answer": None,
         "error": None,
     }

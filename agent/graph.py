@@ -18,6 +18,7 @@ from langgraph.checkpoint.memory import MemorySaver
 
 from agent.state import ShukiState
 from agent.nodes import (
+    discovery_node,
     planner_node,
     skill_picker_node,
     replanner_node,
@@ -28,6 +29,8 @@ from agent.nodes import (
     verifier_node,
     summarizer_node,
     finalizer_node,
+    route_start,
+    route_after_planner,
     route_after_skill_picker,
     route_after_verifier,
     route_after_summarizer,
@@ -38,6 +41,7 @@ def build_graph(checkpointer=None):
     builder = StateGraph(ShukiState)
 
     # ── Nodes ──────────────────────────────────────────────────────────────────
+    builder.add_node("discovery",      discovery_node)
     builder.add_node("planner",        planner_node)
     builder.add_node("skill_picker",   skill_picker_node)
     builder.add_node("replanner",      replanner_node)
@@ -51,8 +55,25 @@ def build_graph(checkpointer=None):
 
     # ── Edges ──────────────────────────────────────────────────────────────────
 
-    builder.add_edge(START, "planner")
-    builder.add_edge("planner", "skill_picker")
+    builder.add_conditional_edges(
+        START,
+        route_start,
+        {
+            "discovery": "discovery",
+            "planner":   "planner",
+        }
+    )
+
+    builder.add_edge("discovery", "planner")
+
+    builder.add_conditional_edges(
+        "planner",
+        route_after_planner,
+        {
+            "discovery":    "discovery",
+            "skill_picker": "skill_picker",
+        }
+    )
 
     builder.add_conditional_edges(
         "skill_picker",
