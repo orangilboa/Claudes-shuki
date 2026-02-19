@@ -24,7 +24,7 @@ def build_llm(
         base_url=f"{cfg.base_url.rstrip('/')}/v1",
         api_key=cfg.api_key,
         model=cfg.model,
-        max_tokens=max_tokens or cfg.executor_budget_tokens,
+        max_tokens=max_tokens or cfg.max_output_tokens,
         temperature=temperature,
         streaming=streaming,
         max_retries=1,

@@ -77,7 +77,8 @@ pip install -r requirements.txt
 $env:LLM_BASE_URL = "http://your-server:11434"   # Ollama, LM Studio, vLLM, etc.
 $env:LLM_MODEL    = "llama3"
 $env:LLM_API_KEY  = "none"
-$env:MAX_CONTEXT_TOKENS = "2048"   # your model's actual limit
+$env:MAX_INPUT_TOKENS = "8192"             # input context budget
+$env:MAX_OUTPUT_TOKENS = "4096"            # your model's output limit
 $env:WORKSPACE_ROOT = "C:\myproject"
 ```
 
@@ -251,7 +252,8 @@ Then implement the tools in `tools/` and call `register_tool()` at startup.
 | `LLM_BASE_URL` | `http://localhost:11434` | LLM server URL |
 | `LLM_MODEL` | `llama3` | Model name |
 | `LLM_API_KEY` | `ollama` | API key |
-| `MAX_CONTEXT_TOKENS` | `2048` | Context window size |
+| `MAX_INPUT_TOKENS` | `8192` | Input context budget |
+| `MAX_OUTPUT_TOKENS` | `4096` | Max output tokens per API call |
 | `WORKSPACE_ROOT` | `./workspace` | Working directory |
 | `SHUKI_SHELL` | `powershell` | Shell for run_command |
 | `SHUKI_VERBOSE` | `1` | Print debug info |

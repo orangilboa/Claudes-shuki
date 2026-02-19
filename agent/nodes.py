@@ -98,7 +98,7 @@ def planner_node(state: ShukiState) -> dict:
     session = BudgetedSession(
         system_prompt=PLANNER_SYSTEM.format(max_subtasks=config.llm.max_subtasks),
         tools=None,
-        max_tokens=config.llm.planner_budget_tokens,
+        max_tokens=config.llm.max_output_tokens,
         verbose=verbose,
     )
     response = session.invoke(
@@ -177,7 +177,7 @@ def replanner_node(state: ShukiState) -> dict:
     session = BudgetedSession(
         system_prompt=REPLANNER_SYSTEM,
         tools=None,
-        max_tokens=config.llm.planner_budget_tokens,
+        max_tokens=config.llm.max_output_tokens,
         verbose=verbose,
     )
     response = session.invoke(
@@ -375,13 +375,36 @@ def reasoner_node(state: ShukiState) -> dict:
     session = BudgetedSession(
         system_prompt=system,
         tools=read_tool_objects,
-        max_tokens=config.llm.executor_budget_tokens,
+        max_tokens=config.llm.max_output_tokens,
         verbose=verbose,
     )
 
     prompt = f"TASK: {task.description}"
     if context_str:
         prompt += f"\n\nContext:\n{context_str}"
+
+    # On retry after failed patch: inject the error details and actual file content
+    # so the model knows exactly what went wrong and can copy-paste the real strings.
+    if task.retry_count > 0:
+        wr = getattr(task, "write_result", {})
+        prev_plan = getattr(task, "edit_plan", {})
+        retry_ctx = "\n\n━━━ PREVIOUS ATTEMPT FAILED ━━━\n"
+        retry_ctx += f"Writer error: {wr.get('message', 'unknown')}\n"
+        retry_ctx += f"Failed edit plan: {json.dumps(prev_plan)[:600]}\n"
+        # If we know the target file, inject its actual content
+        target_file = prev_plan.get("file", "")
+        if target_file:
+            try:
+                actual = TOOL_MAP["read_file"].invoke({"path": target_file})
+                retry_ctx += (f"\nACTUAL current content of {target_file} "
+                              f"(copy strings EXACTLY from here):\n{actual}")
+            except Exception:
+                pass
+        retry_ctx += "\n━━━ END PREVIOUS ATTEMPT ━━━\n"
+        retry_ctx += ("\nIMPORTANT: Your previous 'old' string did NOT match "
+                      "the file. You MUST copy the exact text from the file "
+                      "content shown above. Do NOT paraphrase or rewrite it.")
+        prompt += retry_ctx
 
     response = session.invoke(prompt)
     file_index_updates = {}
@@ -515,10 +538,16 @@ def writer_node(state: ShukiState) -> dict:
                     "old_str": old_str,
                     "new_str": new_str,
                 })
-                results.append(f"Patch {i+1}: {result}")
                 if not str(result).startswith("OK"):
+                    # Include the failed old_str in the error for debugging
+                    results.append(
+                        f"Patch {i+1}: ERROR: String not found in {file_path}. "
+                        f"Check whitespace/indentation."
+                    )
                     all_ok = False
                     break  # stop on first failure so verifier can see which patch failed
+                else:
+                    results.append(f"Patch {i+1}: {result}")
             write_result["success"] = all_ok
             write_result["message"] = "\n".join(results)
             write_result["file"]    = file_path
@@ -615,7 +644,7 @@ def verifier_node(state: ShukiState) -> dict:
     elif action == "multi_patch":
         # For multi_patch, verify that at least one of the new strings is present
         # and none of the old strings remain
-        patches     = edit_plan.get("patches", [])
+        patches     = task.edit_plan.get("patches", [])
         new_found   = 0
         old_remains = 0
         for patch in patches:
@@ -685,7 +714,7 @@ def summarizer_node(state: ShukiState) -> dict:
     session = BudgetedSession(
         system_prompt=SUMMARIZER_SYSTEM,
         tools=None,
-        max_tokens=config.llm.summarizer_budget_tokens,
+        max_tokens=config.llm.max_output_tokens,
         verbose=verbose,
     )
     response = session.invoke(prompt)
@@ -713,7 +742,7 @@ def finalizer_node(state: ShukiState) -> dict:
     session = BudgetedSession(
         system_prompt=FINALIZER_SYSTEM,
         tools=None,
-        max_tokens=config.llm.planner_budget_tokens,
+        max_tokens=config.llm.max_output_tokens,
         verbose=verbose,
     )
     response = session.invoke(

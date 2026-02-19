@@ -21,23 +21,28 @@ class LLMConfig:
     model: str = os.getenv("LLM_MODEL", "llama3")
     api_key: str = os.getenv("LLM_API_KEY", "ollama")  # some endpoints require a key
 
-    # --- Context window budget ---
-    # Leave room for the model's output. Set this conservatively.
-    max_context_tokens: int = int(os.getenv("MAX_CONTEXT_TOKENS", "2048"))
+    # --- Token budgets ---
+    # Max input tokens for context assembly (up to the model's input context limit).
+    # Claude 3 Haiku: 200K, most Ollama models: 2K-8K
+    max_input_tokens: int = int(os.getenv("MAX_INPUT_TOKENS", "8192"))
+
+    # Max output tokens per API call (must not exceed the model's output limit).
+    # Claude 3 Haiku: 4096, Claude 3.5 Sonnet: 8192, most Ollama models: 2048-4096
+    max_output_tokens: int = int(os.getenv("MAX_OUTPUT_TOKENS", "4096"))
 
     # Rough chars-per-token estimate (conservative for code)
     chars_per_token: float = 3.5
 
-    # Per-node token budgets — derived in __post_init__ from max_context_tokens:
-    #   planner: 20%, executor: 60%, summarizer: 20%
-    planner_budget_tokens: int = 0
-    executor_budget_tokens: int = 0
-    summarizer_budget_tokens: int = 0
+    # Per-node INPUT context budgets — controls how much context ContextAssembler
+    # injects into prompts. Split: planner 20%, executor 60%, summarizer 20%.
+    planner_input_budget: int = 0
+    executor_input_budget: int = 0
+    summarizer_input_budget: int = 0
 
     def __post_init__(self):
-        self.planner_budget_tokens    = int(self.max_context_tokens * 0.20)
-        self.executor_budget_tokens   = int(self.max_context_tokens * 0.60)
-        self.summarizer_budget_tokens = int(self.max_context_tokens * 0.20)
+        self.planner_input_budget    = int(self.max_input_tokens * 0.20)
+        self.executor_input_budget   = int(self.max_input_tokens * 0.60)
+        self.summarizer_input_budget = int(self.max_input_tokens * 0.20)
 
     # Max tokens per prior-task summary injected into executor context
     summary_max_chars: int = 300
@@ -47,6 +52,7 @@ class LLMConfig:
 
     # Max subtasks the planner may generate
     max_subtasks: int = 12
+
 
 
 @dataclass

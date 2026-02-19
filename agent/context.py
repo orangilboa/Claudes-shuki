@@ -21,13 +21,13 @@ class ContextAssembler:
       - Subtask description   : always included
       - Prior summaries       : config.llm.summary_max_chars each, most-recent first
       - File snippets         : config.llm.file_snippet_max_chars each
-      - Total cap             : executor_budget_tokens * chars_per_token
+      - Total cap             : executor_input_budget * chars_per_token
     """
 
     def __init__(self):
         self.ws = Path(config.workspace.root).resolve()
         self.budget = int(
-            config.llm.executor_budget_tokens * config.llm.chars_per_token
+            config.llm.executor_input_budget * config.llm.chars_per_token
         )
 
     def build(self, task: SubTask, state: ShukiState) -> str:
