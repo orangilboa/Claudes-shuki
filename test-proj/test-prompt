@@ -1,0 +1,1 @@
+I want more elaborate logging instead of printing, please replace all prints with logging. Where print is preceded by if verbose use debug and remove the if verbose, otherwise use info or error

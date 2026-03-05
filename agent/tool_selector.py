@@ -15,6 +15,7 @@ from typing import Optional, Any
 from langchain_core.tools import BaseTool
 
 from config import config
+from agent.session_logger import get_session_logger
 
 
 # ── Category registry ─────────────────────────────────────────────────────────
@@ -100,8 +101,14 @@ def get_tools_for_names(names: list[str]) -> list[Any]:
         obj = get_tool_object(name)
         if obj is not None:
             tools.append(obj)
-        elif config.verbose:
-            print(f"  [ToolSelector] Warning: unknown tool '{name}' skipped")
+        else:
+            get_session_logger().log_step(
+                "TOOL_SELECTOR",
+                "WARN",
+                f"unknown tool '{name}' skipped",
+                console=config.verbose,
+                raw_data={"tool": name},
+            )
     return tools
 
 
@@ -145,8 +152,13 @@ def _load_local_tools():
             try:
                 _load_tools_from_file(fp)
             except Exception as e:
-                if config.verbose:
-                    print(f"  [ToolSelector] Failed to load local tools from {fp}: {e}")
+                get_session_logger().log_step(
+                    "TOOL_SELECTOR",
+                    "ERROR",
+                    f"failed to load local tools from {fp}: {e}",
+                    console=config.verbose,
+                    raw_data={"path": str(fp), "error": str(e)},
+                )
 
     _LOCAL_TOOLS_LOADED = True
 
@@ -175,5 +187,10 @@ def _load_tools_from_file(path: Path):
     for t in tools:
         category = getattr(t, "category", "custom")
         register_tool(t, category)
-        if config.verbose:
-            print(f"  [ToolSelector] Registered local tool: {getattr(t, 'name', str(t))}")
+        get_session_logger().log_step(
+            "TOOL_SELECTOR",
+            "REGISTER",
+            f"registered local tool: {getattr(t, 'name', str(t))}",
+            console=config.verbose,
+            raw_data={"tool": getattr(t, "name", str(t)), "category": category},
+        )

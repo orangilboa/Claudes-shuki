@@ -13,22 +13,35 @@ from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langchain_core.language_models import BaseChatModel
 
 from config import config, LLMConfig
+from agent.session_logger import get_session_logger
 
 
 def _invoke_with_retry(llm, messages, max_retries: int = 3, initial_delay: float = 5.0):
     """Retry an LLM call on 529 overloaded errors with exponential backoff."""
     from openai import InternalServerError
+    logger = get_session_logger()
     delay = initial_delay
     for attempt in range(max_retries + 1):
+        logger.start_waiting(console=config.verbose)
         try:
-            return llm.invoke(messages)
+            response = llm.invoke(messages)
         except InternalServerError as e:
+            logger.stop_waiting(outcome="error")
             if getattr(e, "status_code", None) == 529 and attempt < max_retries:
-                print(f"[LLM] Server overloaded, retrying in {delay:.0f}s (attempt {attempt + 1}/{max_retries})...")
+                logger.log_step(
+                    "LLM",
+                    "RETRY",
+                    f"server overloaded, retrying in {delay:.0f}s (attempt {attempt + 1}/{max_retries})",
+                    console=config.verbose,
+                    raw_data={"status_code": getattr(e, "status_code", None), "error": str(e)},
+                )
                 time.sleep(delay)
                 delay *= 2
             else:
                 raise
+        else:
+            logger.stop_waiting(outcome="success")
+            return response
 
 
 def build_llm(
@@ -106,16 +119,27 @@ class BudgetedSession:
             self.llm = build_llm(max_tokens=max_tokens)
 
     def invoke(self, user_message: str) -> AIMessage:
+        logger = get_session_logger()
         self.messages.append(HumanMessage(content=user_message))
-        if self.verbose:
-            print(f"\n[Session] → {user_message}")
+        logger.log_step(
+            "LLM",
+            "PROMPT",
+            user_message[:200].replace("\n", " "),
+            console=self.verbose,
+            raw_data={"prompt": user_message},
+        )
         response: AIMessage = _invoke_with_retry(self.llm, self.messages)
         # Strip think blocks before storing — they must not accumulate in history
         response = _sanitise_message(response)
         self.messages.append(response)
-        if self.verbose:
-            tc = len(getattr(response, "tool_calls", []) or [])
-            print(f"[Session] ← {str(response.content)} [tool_calls: {tc}]")
+        tc = len(getattr(response, "tool_calls", []) or [])
+        logger.log_step(
+            "LLM",
+            "RESPONSE",
+            f"{str(response.content)[:200].replace(chr(10), ' ')} [tool_calls: {tc}]",
+            console=self.verbose,
+            raw_data={"content": str(response.content), "tool_calls": getattr(response, "tool_calls", [])},
+        )
         return response
 
     def append_tool_result(self, tool_call_id: str, result: str, tool_name: str):
@@ -131,17 +155,28 @@ class BudgetedSession:
         Sanitises all messages before the call (None content, think blocks).
         """
         safe_messages = [_sanitise_message(m) for m in self.messages]
+        logger = get_session_logger()
 
-        if self.verbose:
-            print(f"[Session] continuing ({len(safe_messages)} messages in history)")
+        logger.log_step(
+            "LLM",
+            "CONTINUE",
+            f"continuing with {len(safe_messages)} messages in history",
+            console=self.verbose,
+            raw_data={"message_count": len(safe_messages)},
+        )
 
         response: AIMessage = _invoke_with_retry(self.llm, safe_messages)
         response = _sanitise_message(response)
         self.messages.append(response)
 
-        if self.verbose:
-            tc = len(getattr(response, "tool_calls", []) or [])
-            print(f"[Session] ← {str(response.content)} [tool_calls: {tc}]")
+        tc = len(getattr(response, "tool_calls", []) or [])
+        logger.log_step(
+            "LLM",
+            "RESPONSE",
+            f"{str(response.content)[:200].replace(chr(10), ' ')} [tool_calls: {tc}]",
+            console=self.verbose,
+            raw_data={"content": str(response.content), "tool_calls": getattr(response, "tool_calls", [])},
+        )
 
         return response
 

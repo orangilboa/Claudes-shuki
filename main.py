@@ -43,6 +43,7 @@ if (root / ".shuki").exists():
 from config import config
 from agent.state import initial_state
 from agent.graph import build_graph_with_memory
+from agent.session_logger import get_session_logger
 
 
 BANNER = r"""
@@ -58,50 +59,53 @@ BANNER = r"""
 
 def run_request(graph, request: str, thread_id: str, verbose: bool = False) -> str:
     """Run a single user request through the graph and return the final answer."""
+    logger = get_session_logger()
+    session_file = logger.start_session(request)
+    logger.log_step(
+        "SESSION",
+        "START",
+        f"log file: {session_file.name}",
+        console=verbose,
+        raw_data={"request": request, "thread_id": thread_id, "session_file": str(session_file)},
+    )
+
     state = initial_state(request)
     thread_config = {"configurable": {"thread_id": thread_id}}
 
-    if verbose:
-        print(f"\n{'─'*60}")
-        print(f"Request: {request}")
-        print(f"{'─'*60}")
-
     final_state = None
-    for step in graph.stream(state, config=thread_config, stream_mode="values"):
-        final_state = step
+    try:
+        for step in graph.stream(state, config=thread_config, stream_mode="values"):
+            final_state = step
 
-    if final_state is None:
-        return "Error: no response from agent"
+        if final_state is None:
+            logger.log_step("SESSION", "ERROR", "no response from agent", console=verbose)
+            return "Error: no response from agent"
 
-    answer = final_state.get("final_answer") or "Task completed."
+        answer = final_state.get("final_answer") or "Task completed."
 
-    # Print task summary
-    if verbose:
         plan = final_state.get("plan", [])
-        done  = sum(1 for t in plan if t.status == "done")
+        done = sum(1 for t in plan if t.status == "done")
         total = len(plan)
-        print(f"\n{'─'*60}")
-        print(f"Task report  ({done}/{total} completed):")
-        STATUS_LABEL = {
-            "done":          "done        ",
-            "running":       "interrupted ",
-            "tools":         "stuck:tools ",
-            "skills":        "stuck:skills",
-            "rules":         "stuck:rules ",
-            "needs_resplit": "needs-resplit",
-            "failed":        "FAILED      ",
-            "pending":       "not reached ",
-        }
+        logger.log_step(
+            "SESSION",
+            "REPORT",
+            f"{done}/{total} tasks completed",
+            console=verbose,
+            raw_data={"done": done, "total": total},
+        )
         for t in plan:
-            label = STATUS_LABEL.get(t.status, t.status.ljust(12))
-            tools = ", ".join(c["tool"] for c in t.tool_calls_made) or "none"
-            print(f"  [{label}]  [{t.id}] {t.title}")
-            if t.result_summary:
-                print(f"               → {t.result_summary}")
-            elif t.status not in ("pending", "done"):
-                print(f"               tools used: {tools}")
+            logger.log_step(
+                "SESSION",
+                "TASK",
+                f"[{t.id}] {t.title} status={t.status}",
+                console=verbose,
+                raw_data=t.__dict__,
+            )
 
-    return answer
+        return answer
+    finally:
+        logger.log_step("SESSION", "END", "request finished", console=verbose)
+        logger.end_session()
 
 
 def interactive_repl(graph):

@@ -25,6 +25,7 @@ from agent.rules import load_all_rules, format_all_rules
 from agent.skills import load_all_skills, get_skill_content, build_skills_catalog
 from agent.tool_selector import build_tool_catalog, get_tools_for_names
 from tools.code_tools import ALL_TOOLS, TOOL_MAP, READ_TOOLS
+from agent.session_logger import get_session_logger
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -69,8 +70,8 @@ Provide a complete summary: list every file that contains relevant code, with li
 
 def discovery_node(state: ShukiState) -> dict:
     verbose = config.verbose
-    if verbose:
-        print("\n[Discovery] Exploring workspace...")
+    logger = get_session_logger()
+    logger.log_step("DISCOVERY", "START", "exploring workspace", console=verbose)
 
     # We use the read tools to explore
     read_tools = [TOOL_MAP[n] for n in READ_TOOLS if n in TOOL_MAP]
@@ -99,16 +100,33 @@ def discovery_node(state: ShukiState) -> dict:
             name = tc["name"]
             args = tc["args"]
             tid  = tc["id"]
-            if verbose:
-                print(f"  [Discovery] {name}({json.dumps(args)})")
+            logger.log_step(
+                "DISCOVERY",
+                "TOOL_CALL",
+                f"{name}({json.dumps(args)})",
+                console=verbose,
+                raw_data={"tool": name, "args": args},
+            )
             tool_fn = read_tool_map.get(name)
             result = tool_fn.invoke(args) if tool_fn else f"ERROR: tool '{name}' not available"
+            logger.log_step(
+                "DISCOVERY",
+                "TOOL_RESULT",
+                str(result)[:200].replace("\n", " "),
+                console=verbose,
+                raw_data={"tool": name, "result": str(result)},
+            )
             session.append_tool_result(tid, str(result), name)
         response = session.continue_after_tools()
 
     discovery_results = str(response.content)
-    if verbose:
-        print(f"[Discovery] Summary: {discovery_results[:300].replace(chr(10), ' ')}...")
+    logger.log_step(
+        "DISCOVERY",
+        "SUMMARY",
+        f"{discovery_results[:300].replace(chr(10), ' ')}...",
+        console=verbose,
+        raw_data={"summary": discovery_results},
+    )
 
     return {"discovery_results": discovery_results}
 
@@ -154,9 +172,17 @@ Respond with ONLY valid JSON, no markdown fences.
 
 def planner_node(state: ShukiState) -> dict:
     verbose = config.verbose
+    logger = get_session_logger()
 
     # Load skills and tools catalogs for the system prompt
     all_skills = load_all_skills()
+    logger.log_step(
+        "PLANNER",
+        "SKILLS",
+        f"loaded {len(all_skills)} skill(s): {list(all_skills.keys()) or 'none'}",
+        console=verbose,
+        raw_data={k: str(v["path"]) for k, v in all_skills.items()},
+    )
     skills_catalog = build_skills_catalog(all_skills)
     tools_catalog = build_tool_catalog()
 
@@ -181,18 +207,34 @@ def planner_node(state: ShukiState) -> dict:
     # Check if planner wants more search
     search_req = _parse_search_request(raw)
     if search_req:
-        if verbose:
-            print(f"\n[Planner] Needs more info: {search_req.get('queries')}")
+        logger.log_step(
+            "PLANNER",
+            "SEARCH",
+            f"needs more info: {search_req.get('queries')}",
+            console=verbose,
+            raw_data={"planner_raw": raw, "search_request": search_req},
+        )
         return {
             "discovery_results": f"PLANNER NEEDS MORE INFO: {json.dumps(search_req)}",
             "plan": []  # Signal router to loop back
         }
 
     plan = _parse_plan(raw)
-    if verbose:
-        print(f"\n[Planner] {len(plan)} subtasks:")
-        for t in plan:
-            print(f"  [{t.id}] {t.title}  skill={t.skill}  tools={t.tools}  deps={t.depends_on}")
+    logger.log_step(
+        "PLANNER",
+        "PLAN",
+        f"generated {len(plan)} subtasks",
+        console=verbose,
+        raw_data={"planner_raw": raw, "subtasks": [t.__dict__ for t in plan]},
+    )
+    for t in plan:
+        logger.log_step(
+            "PLANNER",
+            "SUBTASK",
+            f"[{t.id}] {t.title} skill={t.skill} tools={t.tools} deps={t.depends_on}",
+            console=verbose,
+            raw_data=t.__dict__,
+        )
     return {"plan": plan, "current_task_idx": 0}
 
 
@@ -258,6 +300,7 @@ def executor_node(state: ShukiState) -> dict:
     Runs up to 15 tool-call rounds per subtask.
     """
     verbose = config.verbose
+    logger = get_session_logger()
     plan: list[SubTask] = state["plan"]
     idx: int = state["current_task_idx"]
     if idx >= len(plan):
@@ -266,14 +309,28 @@ def executor_node(state: ShukiState) -> dict:
     task = plan[idx]
     task.status = "running"
 
-    if verbose:
-        print(f"\n[Executor] Task {task.id}: {task.title}  skill={task.skill}  tools={task.tools}")
+    logger.log_step(
+        "EXECUTOR",
+        "TASK",
+        f"{task.id}: {task.title} skill={task.skill} tools={task.tools}",
+        console=verbose,
+        raw_data=task.__dict__,
+    )
 
     # Load skills and rules
     all_skills = load_all_skills()
     all_rules = load_all_rules()
     skill_content = get_skill_content(task.skill, all_skills)
     rules_content = format_all_rules(all_rules)
+
+    skill_resolved = task.skill in all_skills
+    logger.log_step(
+        "EXECUTOR",
+        "SKILL",
+        f"skill '{task.skill}' {'resolved from file' if skill_resolved else 'not found — using generic fallback'}",
+        console=verbose,
+        raw_data={"skill": task.skill, "resolved": skill_resolved, "available": list(all_skills.keys())},
+    )
 
     skill_section = f"\n\n## Skill: {task.skill}\n{skill_content}" if skill_content else ""
     rules_section = f"\n\n{rules_content}" if rules_content else ""
@@ -335,8 +392,13 @@ def executor_node(state: ShukiState) -> dict:
             name = tc["name"]
             args = tc["args"]
             tid  = tc["id"]
-            if verbose:
-                print(f"  [Executor] {name}({json.dumps(args)})")
+            logger.log_step(
+                "EXECUTOR",
+                "TOOL_CALL",
+                f"{name}({json.dumps(args)})",
+                console=verbose,
+                raw_data={"tool": name, "args": args},
+            )
             tool_fn = tool_map.get(name)
             if tool_fn is None:
                 # Try global tool map as fallback
@@ -348,8 +410,13 @@ def executor_node(state: ShukiState) -> dict:
                     result = tool_fn.invoke(args)
                 except Exception as e:
                     result = f"ERROR: tool call failed — {e}"
-            if verbose:
-                print(f"  [Result] {str(result)[:200]}")
+            logger.log_step(
+                "EXECUTOR",
+                "TOOL_RESULT",
+                str(result)[:200].replace("\n", " "),
+                console=verbose,
+                raw_data={"tool": name, "result": str(result)},
+            )
             # Track write/patch operations for verifier
             if name in ("write_file", "patch_file", "create_file") and "path" in args:
                 fp = args["path"]
@@ -379,6 +446,7 @@ def verifier_node(state: ShukiState) -> dict:
     Sets task.verify_passed and task.verify_message.
     """
     verbose = config.verbose
+    logger = get_session_logger()
     plan: list[SubTask] = state["plan"]
     idx:  int           = state["current_task_idx"]
     if idx >= len(plan):
@@ -386,8 +454,7 @@ def verifier_node(state: ShukiState) -> dict:
 
     task = plan[idx]
 
-    if verbose:
-        print(f"\n[Verifier] Task {task.id}")
+    logger.log_step("VERIFIER", "TASK", f"task {task.id}", console=verbose, raw_data=task.__dict__)
 
     # No file changes attempted — treat as passed (read-only or info task)
     if not task.files_modified:
@@ -419,9 +486,14 @@ def verifier_node(state: ShukiState) -> dict:
             f"Verified: {len(task.files_modified)} file(s) confirmed: {task.files_modified}"
         )
 
-    if verbose:
-        status = "✓" if task.verify_passed else "✗"
-        print(f"  [{status}] {task.verify_message}")
+    status = "pass" if task.verify_passed else "fail"
+    logger.log_step(
+        "VERIFIER",
+        status,
+        task.verify_message,
+        console=verbose,
+        raw_data={"task_id": task.id, "verify_passed": task.verify_passed},
+    )
 
     task.status = "done"
     return {"plan": plan, "file_index": file_index_updates}
@@ -435,6 +507,7 @@ Be specific: file name, what changed, outcome. No filler."""
 
 def summarizer_node(state: ShukiState) -> dict:
     verbose = config.verbose
+    logger = get_session_logger()
     plan: list[SubTask] = state["plan"]
     idx:  int           = state["current_task_idx"]
     if idx >= len(plan):
@@ -459,8 +532,13 @@ def summarizer_node(state: ShukiState) -> dict:
     response = session.invoke(prompt)
     task.result_summary = str(response.content).strip()
 
-    if verbose:
-        print(f"[Summarizer] {task.result_summary}")
+    logger.log_step(
+        "SUMMARIZER",
+        "SUMMARY",
+        task.result_summary,
+        console=verbose,
+        raw_data={"task_id": task.id, "summary": task.result_summary},
+    )
 
     return {"plan": plan, "current_task_idx": idx + 1}
 
@@ -474,6 +552,7 @@ Mention what was created, changed, or found. Be specific."""
 
 def finalizer_node(state: ShukiState) -> dict:
     verbose = config.verbose
+    logger = get_session_logger()
     plan = state.get("plan", [])
     summaries = "\n".join(
         f"- {t.title}: {t.result_summary or 'completed'}" for t in plan
@@ -488,8 +567,13 @@ def finalizer_node(state: ShukiState) -> dict:
         f"User request: {state['user_request']}\n\nCompleted:\n{summaries}"
     )
     answer = str(response.content)
-    if verbose:
-        print(f"\n[Finalizer]\n{answer}")
+    logger.log_step(
+        "FINALIZER",
+        "ANSWER",
+        answer.replace("\n", " "),
+        console=verbose,
+        raw_data={"final_answer": answer},
+    )
     return {"final_answer": answer}
 
 
@@ -526,8 +610,13 @@ def route_after_verifier(state: ShukiState) -> str:
 
     if not verify_passed and retry_count < 1:
         task.retry_count = retry_count + 1
-        if config.verbose:
-            print(f"  [Router] Verification failed — retrying executor (attempt {task.retry_count})")
+        get_session_logger().log_step(
+            "ROUTER",
+            "RETRY",
+            f"verification failed, retrying executor (attempt {task.retry_count})",
+            console=config.verbose,
+            raw_data={"task_id": task.id, "verify_message": task.verify_message},
+        )
         return "retry"
 
     return "summarize"
